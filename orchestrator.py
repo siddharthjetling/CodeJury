@@ -1,7 +1,7 @@
 """
 CodeJury Orchestrator — the only agent users interact with via ASI:One.
 Reads PR + spec from GitHub, detects change type, routes to specialist agents,
-collects results, sends to Verdict Agent, returns final APPROVE/BLOCK.
+collects results, sends to Verdict Agent, returns final PASS/BLOCK/INCONCLUSIVE.
 """
 import json, re
 from datetime import datetime
@@ -73,7 +73,6 @@ def fetch_pr_diff(owner: str, repo: str, pr_number: int) -> str:
         r = httpx.get(url, headers={"Accept": "application/vnd.github.v3.diff"}, timeout=15)
         if r.status_code == 200:
             diff = r.text
-            # truncate very large diffs to keep within LLM context
             if len(diff) > 8000:
                 diff = diff[:8000] + "\n\n... [diff truncated at 8000 chars]"
             return diff
@@ -116,25 +115,21 @@ def extract_spec(text: str, pr_info: dict, owner: str, repo: str) -> str:
     2. Linked issue from PR body
     3. PR title + body as fallback
     """
-    # check if user pasted an issue URL directly
     m = GITHUB_ISSUE_RE.search(text)
     if m:
         spec = fetch_issue_body(m.group(1), m.group(2), int(m.group(3)))
         if spec:
             return spec
 
-    # try to find linked issue reference in PR body
     pr_body = pr_info.get("body", "") or ""
     pr_title = pr_info.get("title", "") or ""
 
-    # common patterns: "Fixes #42", "Closes #42", "Resolves #42"
     issue_ref = re.search(r"(?:fixes|closes|resolves|fix|close|resolve)\s+#(\d+)", pr_body, re.IGNORECASE)
     if issue_ref:
         spec = fetch_issue_body(owner, repo, int(issue_ref.group(1)))
         if spec:
             return spec
 
-    # fallback: use PR title + body as the spec
     spec = f"PR Title: {pr_title}\n\n{pr_body}" if pr_body else f"PR Title: {pr_title}"
     return spec
 
@@ -147,24 +142,66 @@ SECURITY_KEYWORDS = [
     "xss", "injection", "api_key", "apikey", "private_key",
 ]
 
+PERFORMANCE_KEYWORDS = [
+    "query", "select", "insert", "update", "delete", "join",
+    "database", "db", "sql", "orm", "cursor", "execute",
+    "loop", "for ", "while ", "foreach", "map(", "filter(",
+    "fetch", "request", "http", "api_call",
+    "cache", "redis", "memcache",
+    "bulk", "batch", "paginate", "limit", "offset",
+]
+
 def detect_agents_to_fire(pr_diff: str) -> list[str]:
     """
     Decide which specialist agents to fire based on PR diff content.
-    BehaviorAgent always fires. Others fire conditionally.
+    Correctness always fires (mandatory baseline). Others fire conditionally.
+    Routing cannot disable mandatory checks.
     """
-    agents = [config.BEHAVIOR_AGENT_ADDRESS]  # always fires
+    agents = [config.CORRECTNESS_AGENT_ADDRESS]  # mandatory baseline — always fires
 
     diff_lower = pr_diff.lower()
+
     if any(kw in diff_lower for kw in SECURITY_KEYWORDS):
         agents.append(config.SECURITY_AGENT_ADDRESS)
+
+    if any(kw in diff_lower for kw in PERFORMANCE_KEYWORDS):
+        if config.PERFORMANCE_AGENT_ADDRESS != "agent1q...":  # only if configured
+            agents.append(config.PERFORMANCE_AGENT_ADDRESS)
 
     return agents
 
 
-AGENT_NAMES = {
-    config.BEHAVIOR_AGENT_ADDRESS: "BehaviorAgent",
-    config.SECURITY_AGENT_ADDRESS: "SecurityAgent",
-}
+AGENT_NAMES = {}
+
+def _init_agent_names():
+    """Initialize after config is loaded."""
+    global AGENT_NAMES
+    AGENT_NAMES = {
+        config.CORRECTNESS_AGENT_ADDRESS:  "Correctness",
+        config.SECURITY_AGENT_ADDRESS:     "Security",
+        config.PERFORMANCE_AGENT_ADDRESS:  "Performance",
+    }
+
+def _get_agent_name(addr: str) -> str:
+    if not AGENT_NAMES:
+        _init_agent_names()
+    return AGENT_NAMES.get(addr, addr)
+
+
+def _routing_reason(pr_diff: str) -> list[str]:
+    """Explain why each agent was selected — shown in the verdict."""
+    reasons = ["Correctness (mandatory baseline — always fires)"]
+    diff_lower = pr_diff.lower()
+
+    sec_found = [kw for kw in SECURITY_KEYWORDS if kw in diff_lower]
+    if sec_found:
+        reasons.append(f"Security (detected: {', '.join(sec_found[:5])})")
+
+    perf_found = [kw for kw in PERFORMANCE_KEYWORDS if kw in diff_lower]
+    if perf_found and config.PERFORMANCE_AGENT_ADDRESS != "agent1q...":
+        reasons.append(f"Performance (detected: {', '.join(perf_found[:5])})")
+
+    return reasons
 
 
 # ── Send response to user ────────────────────────────────────────────────────
@@ -181,12 +218,10 @@ async def send_to_user(ctx: Context, sender: str, text: str, end_session: bool =
 # ── Chat protocol: user sends a message ──────────────────────────────────────
 @chat_proto.on_message(ChatMessage)
 async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
-    # ack
     await ctx.send(sender, ChatAcknowledgement(
         timestamp=datetime.now(), acknowledged_msg_id=msg.msg_id,
     ))
 
-    # extract text
     text = ""
     for item in msg.content:
         if isinstance(item, TextContent):
@@ -213,7 +248,7 @@ async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
         return
 
     pr_url = f"https://github.com/{owner}/{repo}/pull/{pr_number}"
-    await send_to_user(ctx, sender, f"🔍 **Reading PR:** {pr_url}\n\nFetching diff and spec...")
+    await send_to_user(ctx, sender, f"Reading PR: {pr_url}\n\nFetching diff and spec...")
 
     # ── Fetch PR data from GitHub ─────────────────────────────────────────
     pr_info = fetch_pr_info(owner, repo, pr_number)
@@ -232,19 +267,14 @@ async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
 
     # ── Detect which agents to fire ───────────────────────────────────────
     agents_to_fire = detect_agents_to_fire(pr_diff)
-    agent_labels = [AGENT_NAMES.get(a, a) for a in agents_to_fire]
-
-    # detect what triggered which agent
-    triggers = ["BehaviorAgent (always fires)"]
-    if config.SECURITY_AGENT_ADDRESS in agents_to_fire:
-        triggers.append("SecurityAgent (auth/token/security keywords detected in diff)")
+    routing_reasons = _routing_reason(pr_diff)
 
     await send_to_user(
         ctx, sender,
-        f"📋 **Spec extracted** ({len(spec_text)} chars)\n"
-        f"📄 **Diff fetched** ({len(pr_diff)} chars)\n\n"
-        f"**Routing to agents:**\n" +
-        "\n".join(f"  ⚙️ {t}" for t in triggers) +
+        f"Spec extracted ({len(spec_text)} chars)\n"
+        f"Diff fetched ({len(pr_diff)} chars)\n\n"
+        f"**Jury selected:**\n" +
+        "\n".join(f"  - {r}" for r in routing_reasons) +
         "\n\nEach agent reads the spec only — never the code. Generating independent tests..."
     )
 
@@ -265,7 +295,7 @@ async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
             pr_diff=pr_diff,
             pr_url=pr_url,
         ))
-        ctx.logger.info(f"Fired {AGENT_NAMES.get(agent_addr, agent_addr)}")
+        ctx.logger.info(f"Fired {_get_agent_name(agent_addr)}")
 
 
 # ── Internal protocol: specialist agent responds ─────────────────────────────
@@ -283,7 +313,6 @@ async def handle_inspect_response(ctx: Context, sender_agent: str, msg: InspectR
         f"{msg.tests_failed} failed, clean={msg.clean}"
     )
 
-    # store response
     session["agents_responded"].append({
         "agent_name":      msg.agent_name,
         "tests_generated": msg.tests_generated,
@@ -293,22 +322,21 @@ async def handle_inspect_response(ctx: Context, sender_agent: str, msg: InspectR
         "clean":           msg.clean,
     })
 
-    # notify user about this agent's result
     user_sender = session["user_sender"]
-    status = "✅ clean" if msg.clean else f"❌ {msg.tests_failed} issue(s) found"
+    status = "clean" if msg.clean else f"{msg.tests_failed} issue(s) found"
     await send_to_user(
         ctx, user_sender,
-        f"**{msg.agent_name}** — {msg.tests_generated} tests generated — {status}"
+        f"**{msg.agent_name}** — {msg.tests_generated} tests — {status}"
     )
 
     # ── Check if all agents have responded ────────────────────────────────
     if len(session["agents_responded"]) >= session["agents_expected"]:
-        ctx.logger.info("All agents responded. Sending to VerdictAgent.")
+        ctx.logger.info("All agents responded. Sending to Verdict Agent.")
         session["state"] = "waiting_verdict"
 
         await send_to_user(
             ctx, user_sender,
-            "All agents reported. Sending results to **VerdictAgent** for final analysis..."
+            "All agents reported. Applying verdict policy..."
         )
 
         await ctx.send(config.VERDICT_AGENT_ADDRESS, VerdictRequest(
@@ -335,13 +363,14 @@ async def handle_verdict_response(ctx: Context, sender_agent: str, msg: VerdictR
     user_sender = session["user_sender"]
 
     # ── Format verdict card ───────────────────────────────────────────────
-    verdict_emoji = "🟢 APPROVE" if msg.verdict == "APPROVE" else "🔴 BLOCK"
+    verdict_icons = {"PASS": "🟢 PASS", "BLOCK": "🔴 BLOCK", "INCONCLUSIVE": "🟡 INCONCLUSIVE"}
+    verdict_display = verdict_icons.get(msg.verdict, f"⚪ {msg.verdict}")
     risk_bar = "█" * (msg.risk_score // 10) + "░" * (10 - msg.risk_score // 10)
 
     output = (
         f"---\n\n"
         f"## ⚖️ CodeJury Verdict\n\n"
-        f"**{verdict_emoji}** — Risk Score: **{msg.risk_score}/100** [{risk_bar}]\n\n"
+        f"**{verdict_display}** — Risk Score: **{msg.risk_score}/100** [{risk_bar}]\n\n"
         f"**Summary:** {msg.summary}\n\n"
     )
 
@@ -352,7 +381,7 @@ async def handle_verdict_response(ctx: Context, sender_agent: str, msg: VerdictR
             failures = data.get("failures", [])
             total    = data.get("tests_generated", 0)
             if failures:
-                output += f"### ❌ {agent_name} — {len(failures)} issue(s) / {total} tests\n"
+                output += f"### {agent_name} — {len(failures)} issue(s) / {total} tests\n"
                 for f in failures:
                     sev_icon = {"critical": "🔴", "major": "🟡", "minor": "⚪"}.get(
                         f.get("severity", "minor"), "⚪"
@@ -360,14 +389,14 @@ async def handle_verdict_response(ctx: Context, sender_agent: str, msg: VerdictR
                     output += f"  {sev_icon} **{f.get('test', 'unnamed')}** — {f.get('reason', 'no reason')}\n"
                 output += "\n"
             else:
-                output += f"### ✅ {agent_name} — clean ({total} tests passed)\n\n"
+                output += f"### {agent_name} — clean ({total} tests passed)\n\n"
     except Exception:
         output += f"\n{msg.evidence_json}\n"
 
     output += (
         f"---\n\n"
         f"**Proof of independence:** All tests were generated from the spec/issue "
-        f"before the PR code was read. Each agent operated independently with "
+        f"before the PR code was read. Each agent operated in a separate context with "
         f"zero knowledge of the implementation at test generation time.\n\n"
         f"**PR:** {session['pr_url']}"
     )

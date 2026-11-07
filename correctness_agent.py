@@ -1,6 +1,7 @@
 """
-Behavior Agent — the always-on juror in CodeJury.
-Reads the spec/issue ONLY, generates behavioral test cases covering:
+Correctness Agent — the mandatory baseline juror in CodeJury.
+Always fires on every PR. Reads the spec/issue ONLY, generates behavioral
+test cases covering:
   1. Edge cases (null, empty, boundary, type coercion, overflow)
   2. Logic paths (branch coverage, off-by-one, boolean conditions)
   3. State transitions (ordering, idempotency, side effects)
@@ -12,17 +13,14 @@ This agent NEVER generates tests from reading the code first.
 The spec is the sole source of truth — this is the independence guarantee.
 """
 import json
-from openai import OpenAI
 from uagents import Agent, Context, Protocol
 
 from models import InspectRequest, InspectResponse
-
-ASI1_API_KEY = "sk_1760bf82a6cf4388a8f72bdf4b4081d383446c4a62f846bb97bdff74bb136ad2"
-client = OpenAI(base_url="https://api.asi1.ai/v1", api_key=ASI1_API_KEY)
+from llm import ask
 
 agent = Agent(
-    name="codejury-behavior",
-    seed="codejury behavior agent aie summit 2026",
+    name="codejury-correctness",
+    seed="codejury correctness agent aie summit 2026",
     port=8002,
     mailbox=True,
     publish_agent_details=True,
@@ -126,7 +124,7 @@ Rules:
 
 @protocol.on_message(InspectRequest)
 async def handle_inspect(ctx: Context, sender: str, msg: InspectRequest):
-    ctx.logger.info(f"BehaviorAgent: inspecting PR {msg.pr_url} for session {msg.session_id}")
+    ctx.logger.info(f"Correctness: inspecting PR {msg.pr_url} for session {msg.session_id}")
 
     tests_generated = 0
     tests_passed = 0
@@ -138,16 +136,12 @@ async def handle_inspect(ctx: Context, sender: str, msg: InspectRequest):
         # ── PHASE 1: Generate tests from spec only ────────────────────────
         ctx.logger.info("Phase 1: Generating tests from spec...")
 
-        gen_response = client.chat.completions.create(
-            model="asi1",
-            messages=[
-                {"role": "system", "content": GENERATE_TESTS_SYSTEM},
-                {"role": "user",   "content": f"SPECIFICATION:\n\n{msg.spec_text[:3000]}"},
-            ],
+        gen_raw = ask(
+            system=GENERATE_TESTS_SYSTEM,
+            user=f"SPECIFICATION:\n\n{msg.spec_text[:3000]}",
             max_tokens=2000,
         )
 
-        gen_raw = str(gen_response.choices[0].message.content)
         gen_start = gen_raw.find("{")
         gen_end = gen_raw.rfind("}") + 1
         gen_data = json.loads(gen_raw[gen_start:gen_end])
@@ -159,7 +153,7 @@ async def handle_inspect(ctx: Context, sender: str, msg: InspectRequest):
         if tests_generated == 0:
             await ctx.send(sender, InspectResponse(
                 session_id=msg.session_id,
-                agent_name="BehaviorAgent",
+                agent_name="Correctness",
                 tests_generated=0, tests_passed=0, tests_failed=0,
                 failures_json="[]", clean=True,
             ))
@@ -175,16 +169,12 @@ async def handle_inspect(ctx: Context, sender: str, msg: InspectRequest):
             f"{msg.pr_diff[:5000]}"
         )
 
-        run_response = client.chat.completions.create(
-            model="asi1",
-            messages=[
-                {"role": "system", "content": RUN_TESTS_SYSTEM},
-                {"role": "user",   "content": run_content},
-            ],
+        run_raw = ask(
+            system=RUN_TESTS_SYSTEM,
+            user=run_content,
             max_tokens=2000,
         )
 
-        run_raw = str(run_response.choices[0].message.content)
         run_start = run_raw.find("{")
         run_end = run_raw.rfind("}") + 1
         run_data = json.loads(run_raw[run_start:run_end])
@@ -202,7 +192,6 @@ async def handle_inspect(ctx: Context, sender: str, msg: InspectRequest):
                     "reason":   r.get("reason", "no reason provided"),
                     "severity": r.get("severity", "minor"),
                 })
-            # UNCERTAIN counts as neither pass nor fail
 
         clean = tests_failed == 0
         failures_json = json.dumps(failures)
@@ -213,11 +202,11 @@ async def handle_inspect(ctx: Context, sender: str, msg: InspectRequest):
         )
 
     except Exception:
-        ctx.logger.exception("BehaviorAgent inspection failed")
+        ctx.logger.exception("Correctness inspection failed")
 
     await ctx.send(sender, InspectResponse(
         session_id=msg.session_id,
-        agent_name="BehaviorAgent",
+        agent_name="Correctness",
         tests_generated=tests_generated,
         tests_passed=tests_passed,
         tests_failed=tests_failed,
@@ -229,6 +218,6 @@ async def handle_inspect(ctx: Context, sender: str, msg: InspectRequest):
 agent.include(protocol)
 
 if __name__ == "__main__":
-    print(f"\n🧪 Behavior Agent address: {agent.address}\n")
-    print("   → Copy this address into config.py as BEHAVIOR_AGENT_ADDRESS\n")
+    print(f"\n🧪 Correctness Agent address: {agent.address}\n")
+    print("   → Copy this address into config.py as CORRECTNESS_AGENT_ADDRESS\n")
     agent.run()
