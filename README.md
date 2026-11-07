@@ -17,7 +17,7 @@ CodeJury is an independent verifier for AI-generated code. An orchestrator looks
 
 ## Problem Statement: Trust but Verify
 
-AI writes code faster than teams can check whether it's safe to merge. Build an independent verifier that evaluates AI-generated changes, catches defects, and blocks or rolls back anything below the required standard. How can a verifier write its own tests without sharing the implementer's blind spots, and stay independent, reproducible and hard to game?
+AI writes code faster than teams can check whether it's safe to merge. Build an independent verifier that evaluates AI-generated changes, catches defects, and blocks or rolls back anything below the required standard. How can a verifier write its own tests without sharing the implementer's blind spots, and stay independent, reproducible and hard to game?`
 
 ## The Problem
 
@@ -219,18 +219,32 @@ Container isolation is one boundary, not a guarantee against hostile code. The M
 - A Meta Model API key
 
 ```bash
-pip install uagents uagents-core openai httpx pydantic pytest hypothesis
+python -m venv .venv
+.venv\Scripts\activate          # Windows; use source .venv/bin/activate on macOS/Linux
+pip install -r requirements.txt
 ```
 
-Set environment variables (never commit keys):
+Copy `.env.example` to `.env` and fill it in. `.env` is gitignored; never commit it.
 
 ```bash
-META_API_KEY=...        # Meta Model API key
-META_API_BASE_URL=...   # Meta's OpenAI-compatible endpoint
-META_MODEL=...          # Model ID used for reasoning
+META_API_KEY=...                          # Meta Model API key
+META_API_BASE_URL=https://api.meta.ai/v1  # Meta's OpenAI-compatible endpoint
+META_MODEL=muse-spark-1.3                 # Model ID used for reasoning
+ORCHESTRATOR_SEED=...                     # One long random value per agent.
+BEHAVIOR_AGENT_SEED=...                   # A seed is the agent's private key
+SECURITY_AGENT_SEED=...                   # and decides its address.
+VERDICT_AGENT_SEED=...
 ```
 
 API keys stay in the agent processes and are never passed into the test containers.
+
+To check the sandbox and policy gate without any agents or API keys:
+
+```bash
+python demo/build_demo_repo.py --force
+python check_branch.py ai-export-orders         # BLOCK
+python check_branch.py ai-export-orders-fixed   # PASS
+```
 
 ### Step 1: Start the specialist agents (one terminal each)
 

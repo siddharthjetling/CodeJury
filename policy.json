@@ -1,0 +1,6 @@
+{
+  "version": "1",
+  "mandatory_categories": ["baseline", "correctness"],
+  "blocking_categories": ["baseline", "correctness", "security", "performance"],
+  "advisory_categories": ["readability"]
+}

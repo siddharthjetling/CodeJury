@@ -1,0 +1,5 @@
+# Packages available inside the sandbox. Owned by the verifier, not the candidate.
+fastapi==0.115.12
+httpx==0.28.1
+pytest==8.3.5
+hypothesis==6.131.0

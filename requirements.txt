@@ -1,0 +1,8 @@
+# Host-side dependencies for the agents. The test sandbox has its own list in
+# sandbox/requirements.txt.
+uagents
+uagents-core
+openai
+httpx
+pydantic
+python-dotenv

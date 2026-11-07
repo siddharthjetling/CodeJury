@@ -23,7 +23,7 @@ import config
 # ── Agent ─────────────────────────────────────────────────────────────────────
 agent = Agent(
     name="codejury-orchestrator",
-    seed="codejury orchestrator aie summit 2026",
+    seed=config.require_env("ORCHESTRATOR_SEED"),
     port=8001,
     mailbox=True,
     publish_agent_details=True,

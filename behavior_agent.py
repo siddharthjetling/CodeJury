@@ -12,17 +12,15 @@ This agent NEVER generates tests from reading the code first.
 The spec is the sole source of truth — this is the independence guarantee.
 """
 import json
-from openai import OpenAI
 from uagents import Agent, Context, Protocol
 
+import llm
+from config import require_env
 from models import InspectRequest, InspectResponse
-
-ASI1_API_KEY = "sk_1760bf82a6cf4388a8f72bdf4b4081d383446c4a62f846bb97bdff74bb136ad2"
-client = OpenAI(base_url="https://api.asi1.ai/v1", api_key=ASI1_API_KEY)
 
 agent = Agent(
     name="codejury-behavior",
-    seed="codejury behavior agent aie summit 2026",
+    seed=require_env("BEHAVIOR_AGENT_SEED"),
     port=8002,
     mailbox=True,
     publish_agent_details=True,
@@ -138,19 +136,10 @@ async def handle_inspect(ctx: Context, sender: str, msg: InspectRequest):
         # ── PHASE 1: Generate tests from spec only ────────────────────────
         ctx.logger.info("Phase 1: Generating tests from spec...")
 
-        gen_response = client.chat.completions.create(
-            model="asi1",
-            messages=[
-                {"role": "system", "content": GENERATE_TESTS_SYSTEM},
-                {"role": "user",   "content": f"SPECIFICATION:\n\n{msg.spec_text[:3000]}"},
-            ],
-            max_tokens=2000,
+        gen_data = llm.chat_json(
+            GENERATE_TESTS_SYSTEM,
+            f"SPECIFICATION:\n\n{msg.spec_text[:3000]}",
         )
-
-        gen_raw = str(gen_response.choices[0].message.content)
-        gen_start = gen_raw.find("{")
-        gen_end = gen_raw.rfind("}") + 1
-        gen_data = json.loads(gen_raw[gen_start:gen_end])
         tests = gen_data.get("tests", [])
         tests_generated = len(tests)
 
@@ -175,19 +164,7 @@ async def handle_inspect(ctx: Context, sender: str, msg: InspectRequest):
             f"{msg.pr_diff[:5000]}"
         )
 
-        run_response = client.chat.completions.create(
-            model="asi1",
-            messages=[
-                {"role": "system", "content": RUN_TESTS_SYSTEM},
-                {"role": "user",   "content": run_content},
-            ],
-            max_tokens=2000,
-        )
-
-        run_raw = str(run_response.choices[0].message.content)
-        run_start = run_raw.find("{")
-        run_end = run_raw.rfind("}") + 1
-        run_data = json.loads(run_raw[run_start:run_end])
+        run_data = llm.chat_json(RUN_TESTS_SYSTEM, run_content)
         results = run_data.get("results", [])
 
         # ── Tally results ─────────────────────────────────────────────────

@@ -4,18 +4,16 @@ on agents that found issues, produces final APPROVE/BLOCK verdict with
 risk score and full evidence chain.
 """
 import json
-from openai import OpenAI
 from uagents import Agent, Context, Protocol
 
+import llm
+from config import require_env
 from models import VerdictRequest, VerdictResponse
-
-ASI1_API_KEY = "sk_1760bf82a6cf4388a8f72bdf4b4081d383446c4a62f846bb97bdff74bb136ad2"
-client = OpenAI(base_url="https://api.asi1.ai/v1", api_key=ASI1_API_KEY)
 
 agent = Agent(
     name="codejury-verdict",
-    seed="codejury verdict agent aie summit 2026",
-    port=8004,
+    seed=require_env("VERDICT_AGENT_SEED"),
+    port=8005,
     mailbox=True,
     publish_agent_details=True,
 )
@@ -83,19 +81,7 @@ async def handle_verdict(ctx: Context, sender: str, msg: VerdictRequest):
             f"Agent Results:\n{json.dumps(results, indent=2)}"
         )
 
-        r = client.chat.completions.create(
-            model="asi1",
-            messages=[
-                {"role": "system", "content": VERDICT_SYSTEM},
-                {"role": "user",   "content": user_content},
-            ],
-            max_tokens=1500,
-        )
-
-        raw = str(r.choices[0].message.content)
-        start = raw.find("{")
-        end = raw.rfind("}") + 1
-        data = json.loads(raw[start:end])
+        data = llm.chat_json(VERDICT_SYSTEM, user_content, max_tokens=1500)
 
         verdict      = data.get("verdict", "BLOCK").upper()
         risk_score   = int(data.get("risk_score", 50))
