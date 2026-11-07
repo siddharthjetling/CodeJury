@@ -31,7 +31,7 @@ def require_env(name: str) -> str:
 # Step 2: Copy the printed address into each variable below
 # Step 3: Restart orchestrator.py
 
-CORRECTNESS_AGENT_ADDRESS  = "agent1q..."   # from correctness_agent.py output
-SECURITY_AGENT_ADDRESS     = "agent1q..."   # from security_agent.py output
+CORRECTNESS_AGENT_ADDRESS  = "agent1qg73nr5qk98xluvyn8jd4as96rqp2dj5l6pjtpnv6fq5y04v88mzk9mlu42"
+SECURITY_AGENT_ADDRESS     = "agent1qgwsfwfmyctcc7ngmev5qmcqzmzrlaxke546j3rqmtscfm2end0u707nrph"
 PERFORMANCE_AGENT_ADDRESS  = "agent1q..."   # from performance_agent.py output (Siddharth)
-VERDICT_AGENT_ADDRESS      = "agent1q..."   # from verdict_agent.py output
+VERDICT_AGENT_ADDRESS      = "agent1q0u7adys3rqt6atpad62yxw9k05wh80xmmqwvfyy6dpqyhvnycxzu08m9lc"

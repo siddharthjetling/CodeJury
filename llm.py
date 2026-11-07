@@ -59,13 +59,24 @@ def chat(system: str, user: str, max_tokens: int = 2000) -> str:
 ask = chat
 
 
-def chat_json(system: str, user: str, max_tokens: int = 2000) -> dict:
+def chat_json(system: str, user: str, max_tokens: int = 4000) -> dict:
     """Call the model and parse the first JSON object in its reply.
 
-    Raises ValueError if the reply contains no valid JSON object.
+    Retries once with higher max_tokens if JSON is truncated.
+    Returns empty dict on failure instead of raising.
     """
-    raw = chat(system, user, max_tokens)
-    start, end = raw.find("{"), raw.rfind("}") + 1
-    if start == -1 or end <= start:
-        raise ValueError(f"Model reply had no JSON object: {raw[:200]!r}")
-    return json.loads(raw[start:end])
+    for attempt in range(2):
+        raw = chat(system, user, max_tokens=max_tokens)
+        start = raw.find("{")
+        end = raw.rfind("}") + 1
+        if start == -1 or end <= start:
+            # no JSON at all — retry with more tokens
+            max_tokens = min(max_tokens * 2, 8000)
+            continue
+        try:
+            return json.loads(raw[start:end])
+        except json.JSONDecodeError:
+            # truncated JSON — retry with more tokens
+            max_tokens = min(max_tokens * 2, 8000)
+            continue
+    return {}

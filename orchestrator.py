@@ -3,7 +3,7 @@ CodeJury Orchestrator — the only agent users interact with via ASI:One.
 Reads PR + spec from GitHub, detects change type, routes to specialist agents,
 collects results, sends to Verdict Agent, returns final PASS/BLOCK/INCONCLUSIVE.
 """
-import json, re
+import json, os, re
 from datetime import datetime
 from uuid import uuid4
 
@@ -58,6 +58,10 @@ GITHUB_ISSUE_RE = re.compile(
     r"(?:https?://)?github\.com/([^/]+)/([^/]+)/issues/(\d+)", re.IGNORECASE
 )
 
+GITHUB_HEADERS = {
+    "Authorization": "Bearer " + os.environ.get("GITHUB_TOKEN", ""),
+}
+
 def parse_pr_url(text: str):
     """Extract owner, repo, pr_number from a GitHub PR URL in the text."""
     m = GITHUB_PR_RE.search(text)
@@ -70,7 +74,7 @@ def fetch_pr_diff(owner: str, repo: str, pr_number: int) -> str:
     """Fetch the PR diff from GitHub API."""
     url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
     try:
-        r = httpx.get(url, headers={"Accept": "application/vnd.github.v3.diff"}, timeout=15)
+        r = httpx.get(url, headers={**GITHUB_HEADERS, "Accept": "application/vnd.github.v3.diff"}, timeout=15)
         if r.status_code == 200:
             diff = r.text
             if len(diff) > 8000:
@@ -85,7 +89,7 @@ def fetch_pr_info(owner: str, repo: str, pr_number: int) -> dict:
     """Fetch PR metadata including linked issue body."""
     url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
     try:
-        r = httpx.get(url, headers={"Accept": "application/vnd.github.v3+json"}, timeout=15)
+        r = httpx.get(url, headers={**GITHUB_HEADERS, "Accept": "application/vnd.github.v3+json"}, timeout=15)
         if r.status_code == 200:
             return r.json()
     except Exception:
@@ -97,7 +101,7 @@ def fetch_issue_body(owner: str, repo: str, issue_number: int) -> str:
     """Fetch the body of a GitHub issue (the spec)."""
     url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}"
     try:
-        r = httpx.get(url, headers={"Accept": "application/vnd.github.v3+json"}, timeout=15)
+        r = httpx.get(url, headers={**GITHUB_HEADERS, "Accept": "application/vnd.github.v3+json"}, timeout=15)
         if r.status_code == 200:
             data = r.json()
             title = data.get("title", "")
@@ -233,6 +237,19 @@ async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
         return
 
     ctx.logger.info(f"User message: {text[:100]}")
+
+    # ── Handle card interaction responses (don't treat as new PR request) ─
+    try:
+        maybe_json = json.loads(text)
+        if isinstance(maybe_json, dict) and ("action" in maybe_json or "finding_id" in maybe_json):
+            action = maybe_json.get("action", "")
+            if action == "view_findings":
+                await send_to_user(ctx, sender, "The findings are shown in the carousel above.", end_session=True)
+            else:
+                await send_to_user(ctx, sender, "Got it. Send another PR URL to verify a new change.", end_session=True)
+            return
+    except (json.JSONDecodeError, TypeError):
+        pass
 
     session = get_session(sender)
 
@@ -390,13 +407,13 @@ def build_verdict_card(verdict: str, risk_score: int, summary: str,
         "title": f"CodeJury Verdict: {verdict}",
         "summary_rows": summary_rows,
         "ctas": [
-            {"label": "View Findings", "selection": {"action": "view_findings"}, "primary": True},
+            {"label": "See Agent Reports", "selection": {"action": "see_reports"}, "primary": True},
         ]
     }
 
 
 def build_findings_carousel(evidence_json: str) -> dict | None:
-    """Build a carousel card showing each finding as a scrollable item."""
+    """Build a carousel card showing each defect found. Only shows defects, not clean agents."""
     try:
         evidence = json.loads(evidence_json)
     except Exception:
@@ -404,45 +421,47 @@ def build_findings_carousel(evidence_json: str) -> dict | None:
 
     items = []
     idx = 0
+    total_defects = 0
+
     for agent_name, data in evidence.items():
         failures = data.get("failures", [])
-        if not failures:
-            # clean agent — show as a green card
-            idx += 1
-            items.append({
-                "id": f"finding_{idx}",
-                "title": f"{agent_name}",
-                "subtitle": f"All {data.get('tests_generated', 0)} tests passed",
-                "badges": [{"label": "Clean", "variant": "success"}],
-                "secondary_text": "No issues found",
-                "primary_cta": {
-                    "label": "OK",
-                    "selection": {"finding_id": f"finding_{idx}"}
-                }
-            })
-        else:
+        total = data.get("tests_generated", 0)
+        passed = data.get("tests_passed", 0)
+
+        if failures:
             for f in failures:
                 idx += 1
+                total_defects += 1
                 sev = f.get("severity", "minor")
                 badge_variant = {"critical": "warning", "major": "warning", "minor": "info"}.get(sev, "info")
                 items.append({
-                    "id": f"finding_{idx}",
+                    "id": f"defect_{idx}",
                     "title": f.get("test", "unnamed"),
                     "subtitle": f"{agent_name} — {sev}",
                     "badges": [{"label": sev.upper(), "variant": badge_variant}],
                     "secondary_text": f.get("reason", "no reason"),
-                    "primary_cta": {
-                        "label": "Noted",
-                        "selection": {"finding_id": f"finding_{idx}"}
-                    }
+                    "primary_cta": {"label": "Noted", "selection": {"defect": f"defect_{idx}"}},
                 })
+        else:
+            # clean agent — show as summary card
+            idx += 1
+            items.append({
+                "id": f"agent_{idx}",
+                "title": f"{agent_name} — All Clear",
+                "subtitle": f"{passed} of {total} tests passed",
+                "badges": [{"label": "PASSED", "variant": "success"}],
+                "secondary_text": "No defects found by this agent",
+                "primary_cta": {"label": "OK", "selection": {"agent": f"agent_{idx}"}},
+            })
 
     if not items:
         return None
 
+    defect_label = f"{total_defects} defect(s) found" if total_defects > 0 else "All agents passed"
+
     return {
-        "title": "CodeJury Findings",
-        "subtitle": f"{len(items)} finding(s) across all agents",
+        "title": "CodeJury Agent Reports",
+        "subtitle": f"{len(evidence)} agents checked — {defect_label}",
         "items": items,
     }
 
@@ -479,7 +498,7 @@ async def handle_verdict_response(ctx: Context, sender_agent: str, msg: VerdictR
         f"PR: {session['pr_url']}"
     )
 
-    # ── Send detail card ──────────────────────────────────────────────────
+    # ── Send verdict detail card (informational — no buttons) ──────────
     await ctx.send(user_sender, ChatMessage(
         timestamp=datetime.utcnow(),
         msg_id=uuid4(),
@@ -498,14 +517,14 @@ async def handle_verdict_response(ctx: Context, sender_agent: str, msg: VerdictR
         ]
     ))
 
-    # ── Send findings carousel ────────────────────────────────────────────
+    # ── Send agent reports carousel (informational — no buttons) ──────
     findings_payload = build_findings_carousel(msg.evidence_json)
     if findings_payload:
         await ctx.send(user_sender, ChatMessage(
             timestamp=datetime.utcnow(),
             msg_id=uuid4(),
             content=[
-                TextContent(type="text", text="Scroll through individual findings:"),
+                TextContent(type="text", text="Agent reports:"),
                 MetadataContent(
                     type="metadata",
                     metadata={
@@ -520,7 +539,7 @@ async def handle_verdict_response(ctx: Context, sender_agent: str, msg: VerdictR
             ]
         ))
     else:
-        await send_to_user(ctx, user_sender, "No detailed findings to display.", end_session=True)
+        await send_to_user(ctx, user_sender, "Verification complete.", end_session=True)
 
 
 # ── Ack handler ───────────────────────────────────────────────────────────────
