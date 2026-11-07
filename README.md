@@ -231,8 +231,9 @@ META_API_KEY=...                          # Meta Model API key
 META_API_BASE_URL=https://api.meta.ai/v1  # Meta's OpenAI-compatible endpoint
 META_MODEL=muse-spark-1.3                 # Model ID used for reasoning
 ORCHESTRATOR_SEED=...                     # One long random value per agent.
-BEHAVIOR_AGENT_SEED=...                   # A seed is the agent's private key
+CORRECTNESS_AGENT_SEED=...                # A seed is the agent's private key
 SECURITY_AGENT_SEED=...                   # and decides its address.
+PERFORMANCE_AGENT_SEED=...
 VERDICT_AGENT_SEED=...
 ```
 

@@ -2,7 +2,7 @@
 Security Agent — the conditional juror in CodeJury.
 Only fires when the orchestrator detects auth/token/session/security keywords in the PR diff.
 
-Two-phase approach (same independence guarantee as BehaviorAgent):
+Two-phase approach (same independence guarantee as Correctness Agent):
   PHASE 1: Read spec ONLY → generate security-focused test cases
   PHASE 2: Run those tests against the PR diff
 

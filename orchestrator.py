@@ -1,7 +1,7 @@
 """
 CodeJury Orchestrator — the only agent users interact with via ASI:One.
 Reads PR + spec from GitHub, detects change type, routes to specialist agents,
-collects results, sends to Verdict Agent, returns final APPROVE/BLOCK.
+collects results, sends to Verdict Agent, returns final PASS/BLOCK/INCONCLUSIVE.
 """
 import json, re
 from datetime import datetime
@@ -11,7 +11,7 @@ import httpx
 from uagents import Agent, Context, Protocol
 from uagents_core.contrib.protocols.chat import (
     ChatAcknowledgement, ChatMessage, TextContent, EndSessionContent,
-    chat_protocol_spec,
+    MetadataContent, chat_protocol_spec,
 )
 
 from models import (
@@ -73,7 +73,6 @@ def fetch_pr_diff(owner: str, repo: str, pr_number: int) -> str:
         r = httpx.get(url, headers={"Accept": "application/vnd.github.v3.diff"}, timeout=15)
         if r.status_code == 200:
             diff = r.text
-            # truncate very large diffs to keep within LLM context
             if len(diff) > 8000:
                 diff = diff[:8000] + "\n\n... [diff truncated at 8000 chars]"
             return diff
@@ -116,25 +115,21 @@ def extract_spec(text: str, pr_info: dict, owner: str, repo: str) -> str:
     2. Linked issue from PR body
     3. PR title + body as fallback
     """
-    # check if user pasted an issue URL directly
     m = GITHUB_ISSUE_RE.search(text)
     if m:
         spec = fetch_issue_body(m.group(1), m.group(2), int(m.group(3)))
         if spec:
             return spec
 
-    # try to find linked issue reference in PR body
     pr_body = pr_info.get("body", "") or ""
     pr_title = pr_info.get("title", "") or ""
 
-    # common patterns: "Fixes #42", "Closes #42", "Resolves #42"
     issue_ref = re.search(r"(?:fixes|closes|resolves|fix|close|resolve)\s+#(\d+)", pr_body, re.IGNORECASE)
     if issue_ref:
         spec = fetch_issue_body(owner, repo, int(issue_ref.group(1)))
         if spec:
             return spec
 
-    # fallback: use PR title + body as the spec
     spec = f"PR Title: {pr_title}\n\n{pr_body}" if pr_body else f"PR Title: {pr_title}"
     return spec
 
@@ -147,24 +142,66 @@ SECURITY_KEYWORDS = [
     "xss", "injection", "api_key", "apikey", "private_key",
 ]
 
+PERFORMANCE_KEYWORDS = [
+    "query", "select", "insert", "update", "delete", "join",
+    "database", "db", "sql", "orm", "cursor", "execute",
+    "loop", "for ", "while ", "foreach", "map(", "filter(",
+    "fetch", "request", "http", "api_call",
+    "cache", "redis", "memcache",
+    "bulk", "batch", "paginate", "limit", "offset",
+]
+
 def detect_agents_to_fire(pr_diff: str) -> list[str]:
     """
     Decide which specialist agents to fire based on PR diff content.
-    BehaviorAgent always fires. Others fire conditionally.
+    Correctness always fires (mandatory baseline). Others fire conditionally.
+    Routing cannot disable mandatory checks.
     """
-    agents = [config.BEHAVIOR_AGENT_ADDRESS]  # always fires
+    agents = [config.CORRECTNESS_AGENT_ADDRESS]  # mandatory baseline — always fires
 
     diff_lower = pr_diff.lower()
+
     if any(kw in diff_lower for kw in SECURITY_KEYWORDS):
         agents.append(config.SECURITY_AGENT_ADDRESS)
+
+    if any(kw in diff_lower for kw in PERFORMANCE_KEYWORDS):
+        if config.PERFORMANCE_AGENT_ADDRESS != "agent1q...":  # only if configured
+            agents.append(config.PERFORMANCE_AGENT_ADDRESS)
 
     return agents
 
 
-AGENT_NAMES = {
-    config.BEHAVIOR_AGENT_ADDRESS: "BehaviorAgent",
-    config.SECURITY_AGENT_ADDRESS: "SecurityAgent",
-}
+AGENT_NAMES = {}
+
+def _init_agent_names():
+    """Initialize after config is loaded."""
+    global AGENT_NAMES
+    AGENT_NAMES = {
+        config.CORRECTNESS_AGENT_ADDRESS:  "Correctness",
+        config.SECURITY_AGENT_ADDRESS:     "Security",
+        config.PERFORMANCE_AGENT_ADDRESS:  "Performance",
+    }
+
+def _get_agent_name(addr: str) -> str:
+    if not AGENT_NAMES:
+        _init_agent_names()
+    return AGENT_NAMES.get(addr, addr)
+
+
+def _routing_reason(pr_diff: str) -> list[str]:
+    """Explain why each agent was selected — shown in the verdict."""
+    reasons = ["Correctness (mandatory baseline — always fires)"]
+    diff_lower = pr_diff.lower()
+
+    sec_found = [kw for kw in SECURITY_KEYWORDS if kw in diff_lower]
+    if sec_found:
+        reasons.append(f"Security (detected: {', '.join(sec_found[:5])})")
+
+    perf_found = [kw for kw in PERFORMANCE_KEYWORDS if kw in diff_lower]
+    if perf_found and config.PERFORMANCE_AGENT_ADDRESS != "agent1q...":
+        reasons.append(f"Performance (detected: {', '.join(perf_found[:5])})")
+
+    return reasons
 
 
 # ── Send response to user ────────────────────────────────────────────────────
@@ -181,12 +218,10 @@ async def send_to_user(ctx: Context, sender: str, text: str, end_session: bool =
 # ── Chat protocol: user sends a message ──────────────────────────────────────
 @chat_proto.on_message(ChatMessage)
 async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
-    # ack
     await ctx.send(sender, ChatAcknowledgement(
         timestamp=datetime.now(), acknowledged_msg_id=msg.msg_id,
     ))
 
-    # extract text
     text = ""
     for item in msg.content:
         if isinstance(item, TextContent):
@@ -213,7 +248,7 @@ async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
         return
 
     pr_url = f"https://github.com/{owner}/{repo}/pull/{pr_number}"
-    await send_to_user(ctx, sender, f"🔍 **Reading PR:** {pr_url}\n\nFetching diff and spec...")
+    await send_to_user(ctx, sender, f"Reading PR: {pr_url}\n\nFetching diff and spec...")
 
     # ── Fetch PR data from GitHub ─────────────────────────────────────────
     pr_info = fetch_pr_info(owner, repo, pr_number)
@@ -232,19 +267,14 @@ async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
 
     # ── Detect which agents to fire ───────────────────────────────────────
     agents_to_fire = detect_agents_to_fire(pr_diff)
-    agent_labels = [AGENT_NAMES.get(a, a) for a in agents_to_fire]
-
-    # detect what triggered which agent
-    triggers = ["BehaviorAgent (always fires)"]
-    if config.SECURITY_AGENT_ADDRESS in agents_to_fire:
-        triggers.append("SecurityAgent (auth/token/security keywords detected in diff)")
+    routing_reasons = _routing_reason(pr_diff)
 
     await send_to_user(
         ctx, sender,
-        f"📋 **Spec extracted** ({len(spec_text)} chars)\n"
-        f"📄 **Diff fetched** ({len(pr_diff)} chars)\n\n"
-        f"**Routing to agents:**\n" +
-        "\n".join(f"  ⚙️ {t}" for t in triggers) +
+        f"Spec extracted ({len(spec_text)} chars)\n"
+        f"Diff fetched ({len(pr_diff)} chars)\n\n"
+        f"**Jury selected:**\n" +
+        "\n".join(f"  - {r}" for r in routing_reasons) +
         "\n\nEach agent reads the spec only — never the code. Generating independent tests..."
     )
 
@@ -265,7 +295,7 @@ async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
             pr_diff=pr_diff,
             pr_url=pr_url,
         ))
-        ctx.logger.info(f"Fired {AGENT_NAMES.get(agent_addr, agent_addr)}")
+        ctx.logger.info(f"Fired {_get_agent_name(agent_addr)}")
 
 
 # ── Internal protocol: specialist agent responds ─────────────────────────────
@@ -283,7 +313,6 @@ async def handle_inspect_response(ctx: Context, sender_agent: str, msg: InspectR
         f"{msg.tests_failed} failed, clean={msg.clean}"
     )
 
-    # store response
     session["agents_responded"].append({
         "agent_name":      msg.agent_name,
         "tests_generated": msg.tests_generated,
@@ -293,22 +322,21 @@ async def handle_inspect_response(ctx: Context, sender_agent: str, msg: InspectR
         "clean":           msg.clean,
     })
 
-    # notify user about this agent's result
     user_sender = session["user_sender"]
-    status = "✅ clean" if msg.clean else f"❌ {msg.tests_failed} issue(s) found"
+    status = "clean" if msg.clean else f"{msg.tests_failed} issue(s) found"
     await send_to_user(
         ctx, user_sender,
-        f"**{msg.agent_name}** — {msg.tests_generated} tests generated — {status}"
+        f"**{msg.agent_name}** — {msg.tests_generated} tests — {status}"
     )
 
     # ── Check if all agents have responded ────────────────────────────────
     if len(session["agents_responded"]) >= session["agents_expected"]:
-        ctx.logger.info("All agents responded. Sending to VerdictAgent.")
+        ctx.logger.info("All agents responded. Sending to Verdict Agent.")
         session["state"] = "waiting_verdict"
 
         await send_to_user(
             ctx, user_sender,
-            "All agents reported. Sending results to **VerdictAgent** for final analysis..."
+            "All agents reported. Applying verdict policy..."
         )
 
         await ctx.send(config.VERDICT_AGENT_ADDRESS, VerdictRequest(
@@ -317,6 +345,106 @@ async def handle_inspect_response(ctx: Context, sender_agent: str, msg: InspectR
             spec_text=session["spec_text"],
             results_json=json.dumps(session["agents_responded"]),
         ))
+
+
+# ── Build ASI Interactive Cards ───────────────────────────────────────────────
+def build_verdict_card(verdict: str, risk_score: int, summary: str,
+                       evidence_json: str, pr_url: str) -> dict:
+    """Build a detail card for the verdict."""
+    verdict_badges = {
+        "PASS":         {"label": "PASS",         "variant": "success"},
+        "BLOCK":        {"label": "BLOCK",        "variant": "warning"},
+        "INCONCLUSIVE": {"label": "INCONCLUSIVE", "variant": "info"},
+    }
+    badge = verdict_badges.get(verdict, {"label": verdict, "variant": "info"})
+
+    summary_rows = [
+        {"label": "Verdict",    "value": verdict},
+        {"label": "Risk Score", "value": f"{risk_score}/100"},
+        {"label": "Summary",    "value": summary},
+        {"label": "PR",         "value": pr_url},
+    ]
+
+    # add per-agent rows
+    try:
+        evidence = json.loads(evidence_json)
+        for agent_name, data in evidence.items():
+            failures = data.get("failures", [])
+            total    = data.get("tests_generated", 0)
+            passed   = data.get("tests_passed", 0)
+            failed   = data.get("tests_failed", 0)
+            if failures:
+                summary_rows.append({
+                    "label": agent_name,
+                    "value": f"{failed} failed / {total} tests"
+                })
+            else:
+                summary_rows.append({
+                    "label": agent_name,
+                    "value": f"clean ({passed}/{total} passed)"
+                })
+    except Exception:
+        pass
+
+    return {
+        "title": f"CodeJury Verdict: {verdict}",
+        "summary_rows": summary_rows,
+        "ctas": [
+            {"label": "View Findings", "selection": {"action": "view_findings"}, "primary": True},
+        ]
+    }
+
+
+def build_findings_carousel(evidence_json: str) -> dict | None:
+    """Build a carousel card showing each finding as a scrollable item."""
+    try:
+        evidence = json.loads(evidence_json)
+    except Exception:
+        return None
+
+    items = []
+    idx = 0
+    for agent_name, data in evidence.items():
+        failures = data.get("failures", [])
+        if not failures:
+            # clean agent — show as a green card
+            idx += 1
+            items.append({
+                "id": f"finding_{idx}",
+                "title": f"{agent_name}",
+                "subtitle": f"All {data.get('tests_generated', 0)} tests passed",
+                "badges": [{"label": "Clean", "variant": "success"}],
+                "secondary_text": "No issues found",
+                "primary_cta": {
+                    "label": "OK",
+                    "selection": {"finding_id": f"finding_{idx}"}
+                }
+            })
+        else:
+            for f in failures:
+                idx += 1
+                sev = f.get("severity", "minor")
+                badge_variant = {"critical": "warning", "major": "warning", "minor": "info"}.get(sev, "info")
+                items.append({
+                    "id": f"finding_{idx}",
+                    "title": f.get("test", "unnamed"),
+                    "subtitle": f"{agent_name} — {sev}",
+                    "badges": [{"label": sev.upper(), "variant": badge_variant}],
+                    "secondary_text": f.get("reason", "no reason"),
+                    "primary_cta": {
+                        "label": "Noted",
+                        "selection": {"finding_id": f"finding_{idx}"}
+                    }
+                })
+
+    if not items:
+        return None
+
+    return {
+        "title": "CodeJury Findings",
+        "subtitle": f"{len(items)} finding(s) across all agents",
+        "items": items,
+    }
 
 
 # ── Internal protocol: verdict agent responds ────────────────────────────────
@@ -331,48 +459,68 @@ async def handle_verdict_response(ctx: Context, sender_agent: str, msg: VerdictR
 
     ctx.logger.info(f"Verdict: {msg.verdict} — Risk: {msg.risk_score}")
     session["state"] = "idle"
+    session["last_evidence"] = msg.evidence_json
 
     user_sender = session["user_sender"]
 
-    # ── Format verdict card ───────────────────────────────────────────────
-    verdict_emoji = "🟢 APPROVE" if msg.verdict == "APPROVE" else "🔴 BLOCK"
+    # ── Build verdict detail card ─────────────────────────────────────────
+    verdict_payload = build_verdict_card(
+        msg.verdict, msg.risk_score, msg.summary,
+        msg.evidence_json, session["pr_url"],
+    )
+
+    # ── Also build text fallback for non-card clients ─────────────────────
+    verdict_icons = {"PASS": "PASS", "BLOCK": "BLOCK", "INCONCLUSIVE": "INCONCLUSIVE"}
     risk_bar = "█" * (msg.risk_score // 10) + "░" * (10 - msg.risk_score // 10)
-
-    output = (
-        f"---\n\n"
-        f"## ⚖️ CodeJury Verdict\n\n"
-        f"**{verdict_emoji}** — Risk Score: **{msg.risk_score}/100** [{risk_bar}]\n\n"
-        f"**Summary:** {msg.summary}\n\n"
+    text_fallback = (
+        f"CodeJury Verdict: {msg.verdict} — Risk: {msg.risk_score}/100 [{risk_bar}]\n"
+        f"{msg.summary}\n\n"
+        f"Proof: all tests generated from spec before code was read.\n"
+        f"PR: {session['pr_url']}"
     )
 
-    # parse evidence
-    try:
-        evidence = json.loads(msg.evidence_json)
-        for agent_name, data in evidence.items():
-            failures = data.get("failures", [])
-            total    = data.get("tests_generated", 0)
-            if failures:
-                output += f"### ❌ {agent_name} — {len(failures)} issue(s) / {total} tests\n"
-                for f in failures:
-                    sev_icon = {"critical": "🔴", "major": "🟡", "minor": "⚪"}.get(
-                        f.get("severity", "minor"), "⚪"
-                    )
-                    output += f"  {sev_icon} **{f.get('test', 'unnamed')}** — {f.get('reason', 'no reason')}\n"
-                output += "\n"
-            else:
-                output += f"### ✅ {agent_name} — clean ({total} tests passed)\n\n"
-    except Exception:
-        output += f"\n{msg.evidence_json}\n"
+    # ── Send detail card ──────────────────────────────────────────────────
+    await ctx.send(user_sender, ChatMessage(
+        timestamp=datetime.utcnow(),
+        msg_id=uuid4(),
+        content=[
+            TextContent(type="text", text=text_fallback),
+            MetadataContent(
+                type="metadata",
+                metadata={
+                    "card_protocol_version": "1",
+                    "requires_card_interaction": "true",
+                    "card_kind": "detail",
+                    "card_payload": json.dumps(verdict_payload),
+                    "preferred_drawer_width_px": "600",
+                }
+            ),
+        ]
+    ))
 
-    output += (
-        f"---\n\n"
-        f"**Proof of independence:** All tests were generated from the spec/issue "
-        f"before the PR code was read. Each agent operated independently with "
-        f"zero knowledge of the implementation at test generation time.\n\n"
-        f"**PR:** {session['pr_url']}"
-    )
-
-    await send_to_user(ctx, user_sender, output, end_session=True)
+    # ── Send findings carousel ────────────────────────────────────────────
+    findings_payload = build_findings_carousel(msg.evidence_json)
+    if findings_payload:
+        await ctx.send(user_sender, ChatMessage(
+            timestamp=datetime.utcnow(),
+            msg_id=uuid4(),
+            content=[
+                TextContent(type="text", text="Scroll through individual findings:"),
+                MetadataContent(
+                    type="metadata",
+                    metadata={
+                        "card_protocol_version": "1",
+                        "requires_card_interaction": "true",
+                        "card_kind": "carousel",
+                        "card_payload": json.dumps(findings_payload),
+                        "preferred_drawer_width_px": "600",
+                    }
+                ),
+                EndSessionContent(type="end-session"),
+            ]
+        ))
+    else:
+        await send_to_user(ctx, user_sender, "No detailed findings to display.", end_session=True)
 
 
 # ── Ack handler ───────────────────────────────────────────────────────────────

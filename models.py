@@ -5,7 +5,7 @@ class VerifyRequest(Model):
     session_id: str
     text:       str   # raw user message — contains PR URL and optional spec URL
 
-# ── Orchestrator → Specialist Agents (BehaviorAgent, SecurityAgent) ───────────
+# ── Orchestrator → Specialist Agents (Correctness, Security, Performance) ────
 class InspectRequest(Model):
     session_id: str
     spec_text:  str   # extracted GitHub issue / spec content
@@ -15,7 +15,7 @@ class InspectRequest(Model):
 # ── Specialist Agents → Orchestrator ─────────────────────────────────────────
 class InspectResponse(Model):
     session_id:      str
-    agent_name:      str   # "BehaviorAgent" | "SecurityAgent"
+    agent_name:      str   # "Correctness" | "Security" | "Performance"
     tests_generated: int
     tests_passed:    int
     tests_failed:    int
@@ -32,7 +32,7 @@ class VerdictRequest(Model):
 # ── Verdict Agent → Orchestrator ──────────────────────────────────────────────
 class VerdictResponse(Model):
     session_id:    str
-    verdict:       str   # "APPROVE" | "BLOCK"
+    verdict:       str   # "PASS" | "BLOCK" | "INCONCLUSIVE"
     risk_score:    int   # 0–100
     summary:       str   # one-line reason for verdict
     evidence_json: str   # JSON: {agent_name: {tests_generated, failures: [{test, reason, severity}]}}

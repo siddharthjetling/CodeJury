@@ -1,6 +1,7 @@
 """
-Behavior Agent — the always-on juror in CodeJury.
-Reads the spec/issue ONLY, generates behavioral test cases covering:
+Correctness Agent — the mandatory baseline juror in CodeJury.
+Always fires on every PR. Reads the spec/issue ONLY, generates behavioral
+test cases covering:
   1. Edge cases (null, empty, boundary, type coercion, overflow)
   2. Logic paths (branch coverage, off-by-one, boolean conditions)
   3. State transitions (ordering, idempotency, side effects)
@@ -19,8 +20,8 @@ from config import require_env
 from models import InspectRequest, InspectResponse
 
 agent = Agent(
-    name="codejury-behavior",
-    seed=require_env("BEHAVIOR_AGENT_SEED"),
+    name="codejury-correctness",
+    seed=require_env("CORRECTNESS_AGENT_SEED"),
     port=8002,
     mailbox=True,
     publish_agent_details=True,
@@ -124,7 +125,7 @@ Rules:
 
 @protocol.on_message(InspectRequest)
 async def handle_inspect(ctx: Context, sender: str, msg: InspectRequest):
-    ctx.logger.info(f"BehaviorAgent: inspecting PR {msg.pr_url} for session {msg.session_id}")
+    ctx.logger.info(f"Correctness: inspecting PR {msg.pr_url} for session {msg.session_id}")
 
     tests_generated = 0
     tests_passed = 0
@@ -148,7 +149,7 @@ async def handle_inspect(ctx: Context, sender: str, msg: InspectRequest):
         if tests_generated == 0:
             await ctx.send(sender, InspectResponse(
                 session_id=msg.session_id,
-                agent_name="BehaviorAgent",
+                agent_name="Correctness",
                 tests_generated=0, tests_passed=0, tests_failed=0,
                 failures_json="[]", clean=True,
             ))
@@ -179,7 +180,6 @@ async def handle_inspect(ctx: Context, sender: str, msg: InspectRequest):
                     "reason":   r.get("reason", "no reason provided"),
                     "severity": r.get("severity", "minor"),
                 })
-            # UNCERTAIN counts as neither pass nor fail
 
         clean = tests_failed == 0
         failures_json = json.dumps(failures)
@@ -190,11 +190,11 @@ async def handle_inspect(ctx: Context, sender: str, msg: InspectRequest):
         )
 
     except Exception:
-        ctx.logger.exception("BehaviorAgent inspection failed")
+        ctx.logger.exception("Correctness inspection failed")
 
     await ctx.send(sender, InspectResponse(
         session_id=msg.session_id,
-        agent_name="BehaviorAgent",
+        agent_name="Correctness",
         tests_generated=tests_generated,
         tests_passed=tests_passed,
         tests_failed=tests_failed,
@@ -206,6 +206,6 @@ async def handle_inspect(ctx: Context, sender: str, msg: InspectRequest):
 agent.include(protocol)
 
 if __name__ == "__main__":
-    print(f"\n🧪 Behavior Agent address: {agent.address}\n")
-    print("   → Copy this address into config.py as BEHAVIOR_AGENT_ADDRESS\n")
+    print(f"\n🧪 Correctness Agent address: {agent.address}\n")
+    print("   → Copy this address into config.py as CORRECTNESS_AGENT_ADDRESS\n")
     agent.run()

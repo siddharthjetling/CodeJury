@@ -1,6 +1,8 @@
 """Meta Model API client shared by every agent.
 
-All reasoning goes through here. Settings come from .env:
+All reasoning goes through here, using the OpenAI Python SDK pointed at Meta's
+endpoint. API keys stay in the agent processes and are never passed into test
+containers. Settings come from .env:
   META_API_KEY       required
   META_API_BASE_URL  default https://api.meta.ai/v1
   META_MODEL         default muse-spark-1.3
@@ -41,6 +43,7 @@ def model_settings() -> dict:
 
 
 def chat(system: str, user: str, max_tokens: int = 2000) -> str:
+    """Send a system + user prompt to the Meta Model API and return the reply text."""
     response = _client().chat.completions.create(
         model=model_name(),
         messages=[
@@ -50,6 +53,10 @@ def chat(system: str, user: str, max_tokens: int = 2000) -> str:
         max_tokens=max_tokens,
     )
     return response.choices[0].message.content or ""
+
+
+# Older name used by some agent code.
+ask = chat
 
 
 def chat_json(system: str, user: str, max_tokens: int = 2000) -> dict:
