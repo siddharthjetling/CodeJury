@@ -15,7 +15,7 @@ if sys.version_info >= (3, 14):
 
 # Secrets (API keys, agent seeds) live in .env, which is gitignored.
 # See .env.example for the full list.
-load_dotenv(Path(__file__).resolve().parent / ".env")
+load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
 
 def require_env(name: str) -> str:
