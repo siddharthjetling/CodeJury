@@ -11,7 +11,7 @@ import httpx
 from uagents import Agent, Context, Protocol
 from uagents_core.contrib.protocols.chat import (
     ChatAcknowledgement, ChatMessage, TextContent, EndSessionContent,
-    chat_protocol_spec,
+    MetadataContent, chat_protocol_spec,
 )
 
 from models import (
@@ -347,6 +347,106 @@ async def handle_inspect_response(ctx: Context, sender_agent: str, msg: InspectR
         ))
 
 
+# ── Build ASI Interactive Cards ───────────────────────────────────────────────
+def build_verdict_card(verdict: str, risk_score: int, summary: str,
+                       evidence_json: str, pr_url: str) -> dict:
+    """Build a detail card for the verdict."""
+    verdict_badges = {
+        "PASS":         {"label": "PASS",         "variant": "success"},
+        "BLOCK":        {"label": "BLOCK",        "variant": "warning"},
+        "INCONCLUSIVE": {"label": "INCONCLUSIVE", "variant": "info"},
+    }
+    badge = verdict_badges.get(verdict, {"label": verdict, "variant": "info"})
+
+    summary_rows = [
+        {"label": "Verdict",    "value": verdict},
+        {"label": "Risk Score", "value": f"{risk_score}/100"},
+        {"label": "Summary",    "value": summary},
+        {"label": "PR",         "value": pr_url},
+    ]
+
+    # add per-agent rows
+    try:
+        evidence = json.loads(evidence_json)
+        for agent_name, data in evidence.items():
+            failures = data.get("failures", [])
+            total    = data.get("tests_generated", 0)
+            passed   = data.get("tests_passed", 0)
+            failed   = data.get("tests_failed", 0)
+            if failures:
+                summary_rows.append({
+                    "label": agent_name,
+                    "value": f"{failed} failed / {total} tests"
+                })
+            else:
+                summary_rows.append({
+                    "label": agent_name,
+                    "value": f"clean ({passed}/{total} passed)"
+                })
+    except Exception:
+        pass
+
+    return {
+        "title": f"CodeJury Verdict: {verdict}",
+        "summary_rows": summary_rows,
+        "ctas": [
+            {"label": "View Findings", "selection": {"action": "view_findings"}, "primary": True},
+        ]
+    }
+
+
+def build_findings_carousel(evidence_json: str) -> dict | None:
+    """Build a carousel card showing each finding as a scrollable item."""
+    try:
+        evidence = json.loads(evidence_json)
+    except Exception:
+        return None
+
+    items = []
+    idx = 0
+    for agent_name, data in evidence.items():
+        failures = data.get("failures", [])
+        if not failures:
+            # clean agent — show as a green card
+            idx += 1
+            items.append({
+                "id": f"finding_{idx}",
+                "title": f"{agent_name}",
+                "subtitle": f"All {data.get('tests_generated', 0)} tests passed",
+                "badges": [{"label": "Clean", "variant": "success"}],
+                "secondary_text": "No issues found",
+                "primary_cta": {
+                    "label": "OK",
+                    "selection": {"finding_id": f"finding_{idx}"}
+                }
+            })
+        else:
+            for f in failures:
+                idx += 1
+                sev = f.get("severity", "minor")
+                badge_variant = {"critical": "warning", "major": "warning", "minor": "info"}.get(sev, "info")
+                items.append({
+                    "id": f"finding_{idx}",
+                    "title": f.get("test", "unnamed"),
+                    "subtitle": f"{agent_name} — {sev}",
+                    "badges": [{"label": sev.upper(), "variant": badge_variant}],
+                    "secondary_text": f.get("reason", "no reason"),
+                    "primary_cta": {
+                        "label": "Noted",
+                        "selection": {"finding_id": f"finding_{idx}"}
+                    }
+                })
+
+    if not items:
+        return None
+
+    return {
+        "title": "CodeJury Findings",
+        "subtitle": f"{len(items)} finding(s) across all agents",
+        "items": items,
+    }
+
+
 # ── Internal protocol: verdict agent responds ────────────────────────────────
 @internal_proto.on_message(VerdictResponse)
 async def handle_verdict_response(ctx: Context, sender_agent: str, msg: VerdictResponse):
@@ -359,49 +459,68 @@ async def handle_verdict_response(ctx: Context, sender_agent: str, msg: VerdictR
 
     ctx.logger.info(f"Verdict: {msg.verdict} — Risk: {msg.risk_score}")
     session["state"] = "idle"
+    session["last_evidence"] = msg.evidence_json
 
     user_sender = session["user_sender"]
 
-    # ── Format verdict card ───────────────────────────────────────────────
-    verdict_icons = {"PASS": "🟢 PASS", "BLOCK": "🔴 BLOCK", "INCONCLUSIVE": "🟡 INCONCLUSIVE"}
-    verdict_display = verdict_icons.get(msg.verdict, f"⚪ {msg.verdict}")
+    # ── Build verdict detail card ─────────────────────────────────────────
+    verdict_payload = build_verdict_card(
+        msg.verdict, msg.risk_score, msg.summary,
+        msg.evidence_json, session["pr_url"],
+    )
+
+    # ── Also build text fallback for non-card clients ─────────────────────
+    verdict_icons = {"PASS": "PASS", "BLOCK": "BLOCK", "INCONCLUSIVE": "INCONCLUSIVE"}
     risk_bar = "█" * (msg.risk_score // 10) + "░" * (10 - msg.risk_score // 10)
-
-    output = (
-        f"---\n\n"
-        f"## ⚖️ CodeJury Verdict\n\n"
-        f"**{verdict_display}** — Risk Score: **{msg.risk_score}/100** [{risk_bar}]\n\n"
-        f"**Summary:** {msg.summary}\n\n"
+    text_fallback = (
+        f"CodeJury Verdict: {msg.verdict} — Risk: {msg.risk_score}/100 [{risk_bar}]\n"
+        f"{msg.summary}\n\n"
+        f"Proof: all tests generated from spec before code was read.\n"
+        f"PR: {session['pr_url']}"
     )
 
-    # parse evidence
-    try:
-        evidence = json.loads(msg.evidence_json)
-        for agent_name, data in evidence.items():
-            failures = data.get("failures", [])
-            total    = data.get("tests_generated", 0)
-            if failures:
-                output += f"### {agent_name} — {len(failures)} issue(s) / {total} tests\n"
-                for f in failures:
-                    sev_icon = {"critical": "🔴", "major": "🟡", "minor": "⚪"}.get(
-                        f.get("severity", "minor"), "⚪"
-                    )
-                    output += f"  {sev_icon} **{f.get('test', 'unnamed')}** — {f.get('reason', 'no reason')}\n"
-                output += "\n"
-            else:
-                output += f"### {agent_name} — clean ({total} tests passed)\n\n"
-    except Exception:
-        output += f"\n{msg.evidence_json}\n"
+    # ── Send detail card ──────────────────────────────────────────────────
+    await ctx.send(user_sender, ChatMessage(
+        timestamp=datetime.utcnow(),
+        msg_id=uuid4(),
+        content=[
+            TextContent(type="text", text=text_fallback),
+            MetadataContent(
+                type="metadata",
+                metadata={
+                    "card_protocol_version": "1",
+                    "requires_card_interaction": "true",
+                    "card_kind": "detail",
+                    "card_payload": json.dumps(verdict_payload),
+                    "preferred_drawer_width_px": "600",
+                }
+            ),
+        ]
+    ))
 
-    output += (
-        f"---\n\n"
-        f"**Proof of independence:** All tests were generated from the spec/issue "
-        f"before the PR code was read. Each agent operated in a separate context with "
-        f"zero knowledge of the implementation at test generation time.\n\n"
-        f"**PR:** {session['pr_url']}"
-    )
-
-    await send_to_user(ctx, user_sender, output, end_session=True)
+    # ── Send findings carousel ────────────────────────────────────────────
+    findings_payload = build_findings_carousel(msg.evidence_json)
+    if findings_payload:
+        await ctx.send(user_sender, ChatMessage(
+            timestamp=datetime.utcnow(),
+            msg_id=uuid4(),
+            content=[
+                TextContent(type="text", text="Scroll through individual findings:"),
+                MetadataContent(
+                    type="metadata",
+                    metadata={
+                        "card_protocol_version": "1",
+                        "requires_card_interaction": "true",
+                        "card_kind": "carousel",
+                        "card_payload": json.dumps(findings_payload),
+                        "preferred_drawer_width_px": "600",
+                    }
+                ),
+                EndSessionContent(type="end-session"),
+            ]
+        ))
+    else:
+        await send_to_user(ctx, user_sender, "No detailed findings to display.", end_session=True)
 
 
 # ── Ack handler ───────────────────────────────────────────────────────────────
