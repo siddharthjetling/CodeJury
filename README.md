@@ -1,225 +1,357 @@
 # CodeJury ⚖️
-### AI-Powered Independent Code Verifier
+### The right verification team for every code change.
 
-> *"AI writes code 10x faster than humans can review it. 70% of security breaches originate from unreviewed code changes. Every merge is a leap of faith."*
+CodeJury is an independent verifier for AI-generated code. An orchestrator looks at each proposed change, picks the relevant specialist agents, and coordinates their investigations. Each specialist returns evidence. A deterministic policy gate uses that evidence to pass the change, block the merge, or hold it for review.
 
-**CodeJury** is a multi-agent system that acts as an independent jury for every AI-generated PR. It reads your spec, generates its own tests without ever looking at the implementation first, runs them, and delivers a verdict with full evidence — before anything reaches production.
+**Every blocking finding needs proof.**
 
-🔗 **Try it live:** [@codejury on ASI:One](https://asi1.ai)
-📦 **Built for:** AIE Code Summit 2026 — Fetch.ai Challenge
-🏆 **Track:** Trust but Verify
+| | |
+|---|---|
+| **Primary track** | Trust but Verify |
+| **Also submitting to** | Fetch.ai challenge (uAgents, Agentverse, ASI:One) |
+| **Reasoning** | Meta Model API |
+| **Agent runtime and chat access** | Fetch.ai uAgents, Agentverse, ASI:One |
+| **Status** | Hackathon MVP in progress |
 
 ---
+
+## Problem Statement: Trust but Verify
+
+AI writes code faster than teams can check whether it's safe to merge. Build an independent verifier that evaluates AI-generated changes, catches defects, and blocks or rolls back anything below the required standard. How can a verifier write its own tests without sharing the implementer's blind spots, and stay independent, reproducible and hard to game?
 
 ## The Problem
 
-AI coding tools like GitHub Copilot, Cursor, and Claude generate pull requests faster than any team can safely review them.
+A patch can pass existing tests while still introducing a behavioral regression, exposing customer data, or making an endpoint much more expensive to run.
 
-The result:
-- **70%** of security vulnerabilities originate from insufficiently reviewed code changes
-- **60%** of bugs in AI-generated code are caught only after they reach production
-- Traditional code review shares the same blind spots as the implementer — reviewers read the code and work backwards, inheriting every assumption the author made
-
-A reviewer who reads the code first can never be truly independent.
+A reviewer who reads the code first tends to inherit the author's assumptions. Different changes also need different checks. CodeJury picks specialists based on what changed, while always running a mandatory baseline of verification.
 
 ---
 
-## The Solution
+## How It Works
 
 Talk to **@codejury on ASI:One**:
 
 ```
-"Verify this PR: github.com/org/repo/pull/42"
+"Verify the export-orders change in the demo repo and show me any blocking findings."
 ```
 
-CodeJury will:
-1. **Read your spec/issue** — understand what the code is supposed to do
-2. **Route intelligently** — detect what type of change it is (auth? API? async?) and fire the right specialist agents
-3. **Generate tests independently** — each agent reads the spec only, never the code, eliminating shared blind spots
-4. **Run the tests** — against the actual PR code
-5. **Filter by evidence** — only agents that caught something do the deep analysis
-6. **Deliver a verdict** — APPROVE or BLOCK with full evidence: which tests failed, why, severity, and what to fix
+1. **Receive a change:** repository, base commit, candidate commit, and task requirements (spec or issue).
+2. **Run baseline checks:** existing tests and repository-required checks.
+3. **Select the jury:** the orchestrator inspects the diff and selects the relevant specialists.
+4. **Investigate independently:** each specialist generates checks and runs them in an isolated Docker sandbox.
+5. **Present evidence:** reproducible failures, measurements, and advisory findings.
+6. **Deliver a verdict:** a deterministic policy gate returns PASS, BLOCK, or INCONCLUSIVE.
+7. **Show the reasoning:** which checks ran, why they ran, and the evidence behind each finding, returned in the ASI:One chat.
 
 ---
 
 ## Architecture
 
-CodeJury runs on **Fetch.ai uAgents** — specialized agents working as an independent jury:
+Each specialist is its own Fetch.ai uAgent. Agents use the **Meta Model API** (through the OpenAI Python SDK) for reasoning and test generation. Fetch.ai handles agent messaging, registration on Agentverse, and chat access through ASI:One. No Fetch.ai model is used for reasoning.
 
 ```
-You (ASI:One)
-     │
-     ▼
-┌─────────────────────────────────┐
-│        Orchestrator             │  ← The only agent you talk to
-│      @codejury on ASI:One       │  ← Reads PR, detects type, routes
-└──────┬──────────┬───────────────┘
-       │          │
-  ┌────▼────┐ ┌───▼──────┐
-  │Behavior │ │ Security │  ← Fired based on PR type
-  │  Agent  │ │  Agent   │  ← Each reads SPEC ONLY, never code
-  └────┬────┘ └───┬──────┘
-       │          │
-       └────┬─────┘
-            ▼
-     ┌─────────────┐
-     │   Verdict   │  ← Synthesizes all results
-     │    Agent    │  ← APPROVE / BLOCK + evidence
-     └─────────────┘
+You (ASI:One chat)
+        │  Agent Chat Protocol
+        ▼
+┌──────────────────────────────┐
+│ Orchestrator (8001)          │  Reads diff + requirements, selects the jury,
+│ @codejury on Agentverse      │  enforces mandatory checks
+└───┬──────────┬──────────┬────┘
+    │          │          │      Separate contexts, no shared conclusions
+┌───▼──────┐┌──▼───────┐┌─▼───────────┐
+│Correctness││ Security ││ Performance │  Meta Model API for reasoning
+│  (8002)  ││  (8003)  ││   (8004)    │  Tests run in Docker sandbox
+└───┬──────┘└──┬───────┘└─┬───────────┘
+    └──────────┼──────────┘
+               ▼
+┌──────────────────────────────┐
+│ Verdict Agent (8005)         │  Deterministic policy gate decides.
+│                              │  LLM only writes the human summary.
+└──────────────────────────────┘
 ```
 
-### Agent Breakdown
+### The Jury
 
-| Agent | Port | Role |
-|-------|------|------|
-| **Orchestrator** | 8001 | User-facing. Reads PR diff + linked issue. Detects change type. Routes to relevant specialist agents. |
-| **Behavior Agent** | 8002 | Always fires. Reads spec only. Generates edge case tests (null, boundary, empty) + logic tests (branches, conditions). |
-| **Security Agent** | 8003 | Fires when auth/token/password/session detected in diff. Generates tests for injection, auth bypass, missing validation. |
-| **Verdict Agent** | 8004 | Always fires last. Collects all test results. Agents that found nothing stop. Agents that found issues do deep analysis. Produces final APPROVE/BLOCK with risk score. |
+| Agent | Port | Fires when | Expected evidence |
+|---|---|---|---|
+| **Orchestrator** | 8001 | Always | Routing decision and reasons |
+| **Correctness** | 8002 | Always (mandatory baseline) | Executable tests from requirements, failing examples, edge cases |
+| **Security** | 8003 | Access control, auth, data handling, or user input changed | A reproducible violation of a defined rule |
+| **Performance** | 8004 | Database operations, loops over data, or hot endpoints changed | Query counts, timing, or resource measurements under a fixed workload |
+| **Verdict** | 8005 | Always, last | PASS / BLOCK / INCONCLUSIVE plus an evidence summary |
+| Readability | – | Planned extension | Advisory suggestions only |
 
-### How Independence is Guaranteed
+### Intelligent Routing
 
-The core of Trust but Verify is that the verifier **cannot share the implementer's blind spots**.
+The orchestrator selects specialists based on changed files, affected components, task requirements, and repository policy. For example:
 
-CodeJury enforces this structurally:
-- Spec Agent reads the GitHub issue → generates expected behavior
-- Code is never shown to the test-generating agents
-- Tests are derived from intent, not from implementation
-- An implementer cannot optimize their code to game the verifier because the verifier never read their code
+- Access-control changes require security verification.
+- Database changes trigger correctness and performance checks.
+- Public behavior changes trigger contract and regression tests.
+
+**Routing cannot disable mandatory checks.** Repository policy sets the minimum verification even when the orchestrator sees no particular risk. The routing decision and its reasons appear in the verdict.
+
+---
+
+## Independence by Design
+
+- **Spec-first tests.** Behavioral tests are generated from requirements and the public interface (routes, function signatures) before the specialist reads the patch implementation. Patch-aware checks are added afterwards to probe specific risks.
+- **Separate contexts.** Specialists don't see each other's conclusions before producing their initial findings.
+- **Protected artifacts.** The implementing agent can't modify the verifier's protected tests, fixtures, or acceptance policy.
+- **Untrusted input.** Repository content and patch comments are treated as data, never as instructions to the verifier.
+- **No LLM verdicts.** The final decision comes from a deterministic policy gate, so the verdict can't be argued with through prompt injection.
+
+Multiple agents don't guarantee independent reasoning. CodeJury makes independence inspectable through context separation, protected artifacts, and executable evidence.
+
+---
+
+## Evidence Before Verdicts
+
+Each finding includes:
+
+- The affected commit and code location.
+- The requirement or policy being checked.
+- What was observed and what is only inferred.
+- A reproducible test or measurement procedure.
+- Expected and actual behavior.
+- Execution logs and artifacts.
+- Whether it's blocking or advisory.
+
+An AI-generated suspicion isn't automatically a confirmed defect. Performance findings need a defined workload and threshold. Deterministic measurements such as database-call counts are preferred over timing. Where timing is used, it comes from repeated runs.
+
+## Verdict Policy
+
+| Verdict | Meaning | Action |
+|---|---|---|
+| **PASS** | All required checks completed and met the configured standards | Allow the configured merge workflow |
+| **BLOCK** | Evidence shows a required standard was violated | Prevent the merge |
+| **INCONCLUSIVE** | A required check failed to run or the evidence is insufficient | Hold the merge for review or rerun |
+
+PASS means the configured checks passed. It doesn't guarantee the absence of defects. Readability feedback is advisory unless a repository makes a rule mandatory. The MVP blocks defective changes before merge; controlled rollback is a planned extension.
+
+---
+
+## Demo Scenario
+
+An AI adds an **Export Orders** endpoint to the demo repo. The existing test suite passes, but the change has two defects:
+
+1. A customer can receive another customer's orders.
+2. The implementation makes one extra database call per order (N+1 queries).
+
+Example conversation on ASI:One:
+
+```
+You:       Verify the export-orders change in the demo repo.
+
+CodeJury:  Baseline: existing tests passed (24/24).
+
+           Detected: new endpoint, database access, customer data
+           Jury: Correctness (mandatory) + Security + Performance
+
+           Correctness: 7 spec-derived tests, 7 passed ✅
+           Security:    4 tests, 1 failed ❌
+             Customer A received 3 orders belonging to customer B
+             Repro: tests/protected/test_export_isolation.py::test_cross_customer
+           Performance: 1 failed ❌
+             DB queries: 1 order → 2 queries, 100 orders → 101 queries
+             Threshold: ≤ 3 queries regardless of order count
+
+           🔴 BLOCK: 2 required checks failed. Evidence and logs saved to run 0007.
+```
+
+CodeJury then reruns the same saved checks against the corrected patch and returns **PASS**.
+
+---
+
+## Reproducible Verification
+
+Each run saves:
+
+- Base and candidate commit IDs.
+- Requirements and policy versions.
+- Generated test files and input datasets.
+- Container image and dependency versions.
+- Random seeds, commands, and execution limits.
+- Model IDs and generation settings.
+- Logs, measurements, and the final verdict.
+
+Saved tests can be replayed without asking the model to generate them again. Model generation itself may stay nondeterministic.
+
+## Execution Boundaries
+
+Candidate code runs in disposable Docker containers with:
+
+- No model API keys or production credentials.
+- Network disabled during test execution.
+- CPU, memory, and time limits.
+- Separate data stores for the baseline and candidate runs.
+- Read-only mounts for protected verification artifacts.
+
+Container isolation is one boundary, not a guarantee against hostile code. The MVP targets a controlled demo repository.
 
 ---
 
 ## Tech Stack
 
 | Layer | Technology |
-|-------|-----------|
-| Agent Framework | Fetch.ai uAgents |
-| Agent Registry | Agentverse |
-| Chat Interface | ASI:One |
-| AI / LLM | ASI-1 (OpenAI-compatible API) |
-| GitHub Integration | GitHub REST API v3 |
+|---|---|
 | Language | Python 3.11 |
-| Data Models | Pydantic |
-| Session Storage | JSON |
-
----
-
-## Example Conversation
-
-```
-You:        "Verify PR: github.com/org/repo/pull/42"
-
-CodeJury:   Reading spec from linked issue...
-            Reading PR diff...
-            
-            Detected: authentication change
-            Firing: Behavior Agent + Security Agent
-            
-            ⚙️  Behavior Agent generated 6 tests from spec
-            ⚙️  Security Agent generated 5 tests from spec
-            
-            Running 11 tests against PR code...
-            
-            🔴 BLOCK — Risk Score: 81/100
-            
-            Security Agent — 2 failures:
-              ❌ auth token not validated on refresh
-              ❌ missing expiry check allows infinite sessions
-            
-            Behavior Agent — 1 failure:
-              ❌ null user input crashes handler (line 47)
-            
-            Behavior Agent — 5 passed ✅
-            Security Agent — 3 passed ✅
-            
-            Proof: 11 tests generated from spec before
-            any code was read. Verifier had zero knowledge
-            of implementation at test generation time.
-            
-            Fix required before merge.
-```
+| Reasoning and test generation | Meta Model API via the OpenAI Python SDK |
+| Agent framework | Fetch.ai uAgents |
+| Agent registry and chat | Agentverse, ASI:One (Agent Chat Protocol) |
+| Message models | Pydantic |
+| Behavioral testing | pytest, Hypothesis where useful |
+| Test execution | Docker |
+| Version comparison | Git |
+| Evidence storage | SQLite and JSON artifacts |
+| Dashboard (stretch) | React, Vite, Tailwind CSS |
 
 ---
 
 ## How to Run
 
+> These steps describe the target setup. The files are being built during the hackathon.
+
 ### Prerequisites
+
+- Python 3.11
+- Docker running locally
+- A Meta Model API key
+
 ```bash
-pip install uagents uagents-core openai httpx pydantic
+pip install uagents uagents-core openai httpx pydantic pytest hypothesis
 ```
 
-### Step 1 — Start the sub-agents (each in a separate terminal)
+Set environment variables (never commit keys):
 
 ```bash
-# Terminal 1
-python3 behavior_agent.py
-# Copy the printed address → paste into config.py as BEHAVIOR_AGENT_ADDRESS
-
-# Terminal 2
-python3 security_agent.py
-# Copy the printed address → paste into config.py as SECURITY_AGENT_ADDRESS
-
-# Terminal 3
-python3 verdict_agent.py
-# Copy the printed address → paste into config.py as VERDICT_AGENT_ADDRESS
+META_API_KEY=...        # Meta Model API key
+META_API_BASE_URL=...   # Meta's OpenAI-compatible endpoint
+META_MODEL=...          # Model ID used for reasoning
 ```
 
-### Step 2 — Fill in config.py
+API keys stay in the agent processes and are never passed into the test containers.
+
+### Step 1: Start the specialist agents (one terminal each)
+
+```bash
+python correctness_agent.py   # copy printed address → config.py CORRECTNESS_AGENT_ADDRESS
+python security_agent.py      # copy printed address → config.py SECURITY_AGENT_ADDRESS
+python performance_agent.py   # copy printed address → config.py PERFORMANCE_AGENT_ADDRESS
+python verdict_agent.py       # copy printed address → config.py VERDICT_AGENT_ADDRESS
+```
+
+### Step 2: Fill in `config.py`
 
 ```python
-BEHAVIOR_AGENT_ADDRESS = "agent1q..."
-SECURITY_AGENT_ADDRESS = "agent1q..."
-VERDICT_AGENT_ADDRESS  = "agent1q..."
+CORRECTNESS_AGENT_ADDRESS = "agent1q..."
+SECURITY_AGENT_ADDRESS    = "agent1q..."
+PERFORMANCE_AGENT_ADDRESS = "agent1q..."
+VERDICT_AGENT_ADDRESS     = "agent1q..."
 ```
 
-### Step 3 — Create mailboxes on Agentverse
+### Step 3: Connect mailboxes on Agentverse
 
-For each agent, open the inspector URL printed in the terminal and click **Connect**.
+For each agent, open the inspector URL printed in its terminal and click **Connect**.
 
-### Step 4 — Start the orchestrator
+### Step 4: Start the orchestrator
 
 ```bash
-# Terminal 4
-python3 orchestrator.py
+python orchestrator.py
 ```
 
-### Step 5 — Use on ASI:One
+### Step 5: Use it on ASI:One
 
-Go to [asi1.ai](https://asi1.ai) → New Chat → type `@codejury` → paste a PR URL.
+Go to [asi1.ai](https://asi1.ai), start a new chat, type `@codejury`, and ask it to verify a change in the demo repo.
 
 ---
 
-## Project Structure
+## Project Structure (planned)
 
 ```
 CodeJury/
-├── orchestrator.py      # Main agent — user-facing, routes to sub-agents
-├── behavior_agent.py    # Edge case + logic tests from spec
-├── security_agent.py    # Security tests from spec
-├── verdict_agent.py     # Final APPROVE/BLOCK verdict with evidence
-├── models.py            # Shared Pydantic message models
-├── config.py            # Sub-agent addresses
-└── sessions.json        # Auto-generated session persistence
+├── orchestrator.py          # User-facing agent: reads diff, routes, enforces mandatory checks
+├── correctness_agent.py     # Spec-first behavioral and regression tests
+├── security_agent.py        # Access-control and data-handling checks
+├── performance_agent.py     # Query counts and workload measurements
+├── verdict_agent.py         # Policy gate + evidence summary
+├── policy_gate.py           # Deterministic PASS / BLOCK / INCONCLUSIVE rules
+├── sandbox/                 # Docker runner, image, resource limits
+├── llm.py                   # Meta Model API client (OpenAI SDK)
+├── models.py                # Shared Pydantic message models
+├── config.py                # Agent addresses and policy settings
+├── storage/                 # SQLite + JSON run artifacts
+├── demo_repo/               # Export Orders app, defective and fixed patches
+│   └── tests/protected/     # Verifier-owned tests the implementer can't change
+└── dashboard/               # Stretch: React run viewer
 ```
 
 ---
 
-## Why CodeJury Wins on the Fetch.ai Track
+## MVP Scope
 
-| Fetch.ai Criterion | How CodeJury meets it |
-|--------------------|----------------------|
-| Agents that prove their work | Every verdict ships with the full test suite + per-test pass/fail + risk score |
-| Multi-agent collaboration | 4 specialized agents with intelligent routing |
-| Meaningful action | Reads GitHub live, runs tests, produces executable verdict |
-| Complete workflow in ASI:One | Paste PR URL → get verdict — no frontend needed |
-| Hard to game | Verifier derives tests from spec, never from code — implementer cannot optimize for it |
-| Could operate post-hackathon | Plugs into any GitHub repo, any team's workflow |
+- One supported Python demo repository.
+- Base vs. candidate commit comparison.
+- Mandatory baseline checks.
+- Dynamic selection of the Correctness, Security, and Performance agents.
+- Independent investigations with executable evidence in Docker.
+- A deterministic policy gate with PASS / BLOCK / INCONCLUSIVE.
+- Full workflow through ASI:One chat.
+- Merge enforcement in a controlled demo workflow.
+
+## Planned Extensions
+
+- Dashboard showing routing, agent progress, and evidence.
+- GitHub pull-request checks and branch-protection integration.
+- More languages and specialist agents (Readability first).
+- Organization-specific verification policies.
+- Controlled rollback workflows.
+- Broader evaluation with defective and correct patches.
+
+## Evaluation
+
+We test CodeJury on a mix of defective and correct changes:
+
+- Does it catch the intended defects?
+- Does it wrongly block correct patches?
+- Can findings be reproduced from saved artifacts?
+- Does routing select the necessary specialists?
+- Does it resist weakened or deleted repository tests?
+- Does it hold the merge when required verification can't complete?
+
+## Fetch.ai Challenge Fit
+
+| Criterion | How CodeJury meets it |
+|---|---|
+| Agents that prove their work | Every verdict ships with reproducible tests, logs, and measurements |
+| Multi-agent collaboration | Orchestrator plus specialist agents, each a separate uAgent, with visible routing |
+| Meaningful action | Runs real tests in a sandbox and blocks or allows the merge |
+| Complete workflow in ASI:One | Ask for a verification, get progress and the verdict in chat |
+| Hard to game | Protected tests, spec-first generation, and a deterministic gate instead of an LLM verdict |
 
 ---
 
-## Built by
+## Team and Work Split
 
-Manali Gawande & Siddharth Jetling
-AIE Code Summit — Fetch.ai Hackathon, November 2026
+| Feature | Owner | Deliverables |
+|---|---|---|
+| Docker sandbox and test runner | Siddharth | Container image, network off, resource limits, log capture |
+| Policy gate and verdict rules | Siddharth | `policy_gate.py`, mandatory-check config, PASS / BLOCK / INCONCLUSIVE |
+| Correctness agent | Siddharth | Spec-first test generation, regression checks |
+| Performance agent | Siddharth | Query-count instrumentation, workload and thresholds |
+| Demo repository | Siddharth | Export Orders app, defective patch, fixed patch, protected tests |
+| Run storage and replay | Siddharth | SQLite + JSON artifacts, replay of saved tests |
+| uAgents foundation | Manali | `models.py`, `config.py`, agent bootstrapping, Agentverse mailboxes |
+| Orchestrator and routing | Manali | Diff reading, jury selection, mandatory-check enforcement |
+| ASI:One chat flow | Manali | Agent Chat Protocol, progress messages, verdict formatting |
+| Security agent | Manali | Access-control and data-isolation checks |
+| Verdict agent | Manali | Collects results, calls the policy gate, writes the LLM summary |
+| Meta Model API client | Shared | `llm.py`, prompts, model settings recorded per run |
+| Demo script and pitch | Shared | End-to-end demo run, slides |
+| Dashboard (stretch) | Whoever finishes first | React run viewer |
 
-*AI moves fast. CodeJury makes sure it moves safely.*
+**Built by** Manali Gawande & Siddharth Jetling
+
+---
+
+**CodeJury: every blocking finding needs proof.**
