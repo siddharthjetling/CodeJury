@@ -257,7 +257,42 @@ async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
         is_card_interaction = True
 
     if is_card_interaction:
-        await send_to_user(ctx, sender, "The full verdict and agent reports are shown above. Send another PR URL to verify a new change.", end_session=True)
+        # Check if user clicked "View Full Report"
+        action = ""
+        try:
+            sel = json.loads(text)
+            action = sel.get("action", "")
+        except Exception:
+            if "full report" in text_lower:
+                action = "full_report"
+
+        if action == "full_report":
+            session = get_session(sender)
+            evidence = session.get("last_evidence", "{}")
+            report_payload = build_report_carousel(evidence)
+            if report_payload:
+                await ctx.send(sender, ChatMessage(
+                    timestamp=datetime.utcnow(),
+                    msg_id=uuid4(),
+                    content=[
+                        TextContent(type="text", text="Full verification report:"),
+                        MetadataContent(
+                            type="metadata",
+                            metadata={
+                                "card_protocol_version": "1",
+                                "requires_card_interaction": "true",
+                                "card_kind": "carousel",
+                                "card_payload": json.dumps(report_payload),
+                                "preferred_drawer_width_px": "600",
+                            }
+                        ),
+                        EndSessionContent(type="end-session"),
+                    ]
+                ))
+            else:
+                await send_to_user(ctx, sender, "No report data available. Try verifying a PR first.", end_session=True)
+        else:
+            await send_to_user(ctx, sender, "Send another PR URL to verify a new change.", end_session=True)
         return
 
     session = get_session(sender)
@@ -374,56 +409,84 @@ async def handle_inspect_response(ctx: Context, sender_agent: str, msg: InspectR
 
 
 # ── Build ASI Interactive Cards ───────────────────────────────────────────────
-def build_summary_card(verdict: str, risk_score: int, summary: str,
-                       evidence_json: str, pr_url: str) -> dict:
-    """Card 1 — concise summary. No buttons."""
+def _shorten_reason(reason: str) -> str:
+    """Shorten a technical finding to a plain English one-liner."""
+    # Take first sentence or first 120 chars
+    for sep in (". ", " — ", "; "):
+        if sep in reason:
+            return reason[:reason.index(sep) + len(sep)].strip()
+    return reason[:120].strip() + ("..." if len(reason) > 120 else "")
+
+
+def build_summary_custom_card(verdict: str, risk_score: int, summary: str,
+                              evidence_json: str, pr_url: str) -> dict:
+    """Card 1 — custom card with plain English issue summaries + View Full Report button."""
+    children = []
+
+    # Header line
+    children.append({"type": "text", "value": f"Risk: {risk_score}/100", "style": "emphasis"})
+
+    # Parse evidence for plain English summaries
+    critical_items = []
+    major_items = []
     total_tests = 0
-    total_defects = 0
-    critical = 0
-    major = 0
-    minor = 0
-    agent_lines = []
 
     try:
         evidence = json.loads(evidence_json)
         for agent_name, data in evidence.items():
-            t = data.get("tests_generated", 0)
-            f = data.get("tests_failed", 0)
-            total_tests += t
-            failures = data.get("failures", [])
-            for fail in failures:
-                total_defects += 1
-                sev = fail.get("severity", "minor")
-                if sev == "critical": critical += 1
-                elif sev == "major": major += 1
-                else: minor += 1
-            if f > 0:
-                agent_lines.append(f"{agent_name}: {f} defect(s) in {t} tests")
-            else:
-                agent_lines.append(f"{agent_name}: all {t} tests passed")
+            total_tests += data.get("tests_generated", 0)
+            for f in data.get("failures", []):
+                sev = f.get("severity", "minor")
+                short = _shorten_reason(f.get("reason", "Issue detected"))
+                if sev == "critical":
+                    critical_items.append(short)
+                elif sev == "major":
+                    major_items.append(short)
     except Exception:
         pass
 
-    severity_parts = []
-    if critical: severity_parts.append(f"{critical} critical")
-    if major: severity_parts.append(f"{major} major")
-    if minor: severity_parts.append(f"{minor} minor")
-    severity_str = ", ".join(severity_parts) if severity_parts else "none"
+    children.append({"type": "text", "value": f"{total_tests} tests run across all agents", "style": "muted"})
+    children.append({"type": "divider"})
+
+    # Critical issues in plain English
+    if critical_items:
+        children.append({"type": "heading", "value": "Critical Issues", "level": 3})
+        for item in critical_items:
+            children.append({"type": "group", "direction": "row", "gap": 4, "children": [
+                {"type": "badge", "label": "CRITICAL", "variant": "warning"},
+                {"type": "text", "value": item, "style": "body"},
+            ]})
+
+    # Major issues in plain English
+    if major_items:
+        children.append({"type": "heading", "value": "Major Issues", "level": 3})
+        for item in major_items:
+            children.append({"type": "group", "direction": "row", "gap": 4, "children": [
+                {"type": "badge", "label": "MAJOR", "variant": "info"},
+                {"type": "text", "value": item, "style": "body"},
+            ]})
+
+    if not critical_items and not major_items:
+        children.append({"type": "text", "value": "No critical or major issues found.", "style": "body"})
+
+    children.append({"type": "divider"})
+    children.append({"type": "text", "value": summary, "style": "muted"})
+
+    # View Full Report button
+    children.append({"type": "button", "label": "View Full Report", "primary": True,
+                     "action": {"selection": {"action": "full_report"}}})
 
     return {
-        "title": f"CodeJury — {verdict}",
-        "summary_rows": [
-            {"label": "Risk Score",   "value": f"{risk_score} / 100"},
-            {"label": "Tests Run",    "value": str(total_tests)},
-            {"label": "Defects",      "value": f"{total_defects} ({severity_str})"},
-            {"label": "Agents",       "value": " | ".join(agent_lines)},
-            {"label": "Why",          "value": summary},
-        ],
+        "root": {
+            "type": "section",
+            "title": f"CodeJury — {verdict}",
+            "children": children,
+        }
     }
 
 
 def build_report_carousel(evidence_json: str) -> dict | None:
-    """Card 2 — full detailed report. Each defect is a scrollable card."""
+    """Card 2 — full detailed report. Each defect is a scrollable card. Sent only on request."""
     try:
         evidence = json.loads(evidence_json)
     except Exception:
@@ -452,6 +515,7 @@ def build_report_carousel(evidence_json: str) -> dict | None:
                     "subtitle": f"Found by {agent_name}",
                     "badges": [{"label": sev.upper(), "variant": badge_variant}],
                     "secondary_text": f.get("reason", "no reason"),
+                    "primary_cta": {"label": "Details", "selection": {"id": f"defect_{idx}"}},
                 })
         else:
             idx += 1
@@ -461,6 +525,7 @@ def build_report_carousel(evidence_json: str) -> dict | None:
                 "subtitle": f"{passed} of {total} tests passed",
                 "badges": [{"label": "ALL CLEAR", "variant": "success"}],
                 "secondary_text": f"No defects found across {total} independent tests",
+                "primary_cta": {"label": "OK", "selection": {"id": f"agent_{idx}"}},
             })
 
     if not items:
@@ -494,15 +559,11 @@ async def handle_verdict_response(ctx: Context, sender_agent: str, msg: VerdictR
 
     user_sender = session["user_sender"]
 
-    # ── Card 1: Summary (detail card) ───────────────────────────────────
-    summary_payload = build_summary_card(
+    # ── Card 1: Summary (custom card with plain English + "View Full Report") ──
+    summary_payload = build_summary_custom_card(
         msg.verdict, msg.risk_score, msg.summary,
         msg.evidence_json, session["pr_url"],
     )
-    # detail cards need at least one CTA to render
-    summary_payload["ctas"] = [
-        {"label": "Scroll down for full report", "selection": {"action": "scroll"}, "primary": True},
-    ]
 
     summary_text = (
         f"CodeJury Verdict: {msg.verdict} — Risk: {msg.risk_score}/100\n"
@@ -519,42 +580,14 @@ async def handle_verdict_response(ctx: Context, sender_agent: str, msg: VerdictR
                 metadata={
                     "card_protocol_version": "1",
                     "requires_card_interaction": "true",
-                    "card_kind": "detail",
+                    "card_kind": "custom",
                     "card_payload": json.dumps(summary_payload),
                     "preferred_drawer_width_px": "540",
                 }
             ),
+            EndSessionContent(type="end-session"),
         ]
     ))
-
-    # ── Card 2: Full Report (carousel) ───────────────────────────────────
-    report_payload = build_report_carousel(msg.evidence_json)
-    if report_payload:
-        # carousel items need primary_cta to render
-        for item in report_payload.get("items", []):
-            if "primary_cta" not in item:
-                item["primary_cta"] = {"label": "Details", "selection": {"id": item.get("id", "")}}
-
-        await ctx.send(user_sender, ChatMessage(
-            timestamp=datetime.utcnow(),
-            msg_id=uuid4(),
-            content=[
-                TextContent(type="text", text="Full verification report:"),
-                MetadataContent(
-                    type="metadata",
-                    metadata={
-                        "card_protocol_version": "1",
-                        "requires_card_interaction": "true",
-                        "card_kind": "carousel",
-                        "card_payload": json.dumps(report_payload),
-                        "preferred_drawer_width_px": "600",
-                    }
-                ),
-                EndSessionContent(type="end-session"),
-            ]
-        ))
-    else:
-        await send_to_user(ctx, user_sender, "Verification complete.", end_session=True)
 
 
 # ── Ack handler ───────────────────────────────────────────────────────────────
