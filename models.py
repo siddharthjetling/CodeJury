@@ -1,38 +1,50 @@
 from uagents import Model
 
-# ── Orchestrator ← User (via ASI:One) ─────────────────────────────────────────
-class VerifyRequest(Model):
-    session_id: str
-    text:       str   # raw user message — contains PR URL and optional spec URL
+# A "check" (inside the *_json fields) is one test result in the policy gate format:
+#   {"id", "category", "source": "repository"|"protected"|"generated"|"agent",
+#    "status": "passed"|"failed"|"error"|"timeout", "message", "evidence"}
+
 
 # ── Orchestrator → Specialist Agents (Correctness, Security, Performance) ────
 class InspectRequest(Model):
-    session_id: str
-    spec_text:  str   # extracted GitHub issue / spec content
-    pr_diff:    str   # extracted PR code diff
-    pr_url:     str   # original PR URL for reference
+    session_id: str   # same as run_id
+    run_id:     str
+    ref:        str   # demo repo branch being verified
+    spec_text:  str   # task requirements; the only input used to write tests
+    pr_diff:    str   # git diff base...ref (for routing context; not used to write tests)
+    pr_url:     str   # display label for the change
+
 
 # ── Specialist Agents → Orchestrator ─────────────────────────────────────────
 class InspectResponse(Model):
-    session_id:      str
-    agent_name:      str   # "Correctness" | "Security" | "Performance"
-    tests_generated: int
-    tests_passed:    int
-    tests_failed:    int
-    failures_json:   str   # JSON list of {test, reason, severity: "critical"|"major"|"minor"}
-    clean:           bool  # True if zero failures — agent stops here, no deep dive needed
+    session_id:   str
+    run_id:       str
+    agent_name:   str   # "Correctness" | "Security" | "Performance"
+    category:     str   # "correctness" | "security" | "performance"
+    error:        str   # empty unless the agent itself crashed
+    tests_run:    int
+    tests_passed: int
+    tests_failed: int
+    checks_json:  str   # JSON list of checks
+    notes_json:   str   # JSON list of strings (discarded tests, generation problems)
+
 
 # ── Orchestrator → Verdict Agent ──────────────────────────────────────────────
 class VerdictRequest(Model):
     session_id:   str
+    run_id:       str
+    ref:          str
     pr_url:       str
-    spec_text:    str
-    results_json: str   # JSON list of all InspectResponse data from all agents
+    checks_json:  str   # baseline + all specialist checks
+    routing_json: str   # JSON list of {category, reason}
+
 
 # ── Verdict Agent → Orchestrator ──────────────────────────────────────────────
 class VerdictResponse(Model):
     session_id:    str
-    verdict:       str   # "PASS" | "BLOCK" | "INCONCLUSIVE"
-    risk_score:    int   # 0–100
-    summary:       str   # one-line reason for verdict
-    evidence_json: str   # JSON: {agent_name: {tests_generated, failures: [{test, reason, severity}]}}
+    run_id:        str
+    verdict:       str   # "PASS" | "BLOCK" | "INCONCLUSIVE" (decided by policy_gate.py)
+    summary:       str   # LLM-written sentence; never changes the verdict
+    reasons_json:  str   # JSON list of strings from the policy gate
+    evidence_json: str   # JSON: {agent_name: {tests_generated, tests_passed, tests_failed,
+                         #         failures: [{test, check_id, source, reason, severity}]}}

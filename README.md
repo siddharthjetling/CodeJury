@@ -239,13 +239,21 @@ VERDICT_AGENT_SEED=...
 
 API keys stay in the agent processes and are never passed into the test containers.
 
-To check the sandbox and policy gate without any agents or API keys:
+Docker must be running. Build the demo repo once:
 
 ```bash
 python demo/build_demo_repo.py --force
-python check_branch.py ai-export-orders         # BLOCK
-python check_branch.py ai-export-orders-fixed   # PASS
 ```
+
+To run the whole jury in one process, without uAgents:
+
+```bash
+python verify.py ai-export-orders                 # BLOCK (uses the Meta API to write tests)
+python verify.py ai-export-orders-fixed           # PASS
+python verify.py ai-export-orders --no-llm        # protected tests only, no API key needed
+```
+
+Each run saves the spec, diff, generated tests and verdict under `runs/<run_id>/`.
 
 ### Step 1: Start the specialist agents (one terminal each)
 
@@ -277,28 +285,41 @@ python orchestrator.py
 
 ### Step 5: Use it on ASI:One
 
-Go to [asi1.ai](https://asi1.ai), start a new chat, type `@codejury`, and ask it to verify a change in the demo repo.
+Go to [asi1.ai](https://asi1.ai), start a new chat, type `@codejury`, and paste a pull request from the demo repo:
+
+```
+@codejury Verify https://github.com/mkg0908/codejury-demo/pull/1
+```
+
+The orchestrator fetches the PR's commit into the local demo repo and runs the full jury on it. Only PRs from `CODEJURY_GITHUB_REPO` (default `mkg0908/codejury-demo`) are accepted, because CodeJury runs the PR's code. The requirements always come from `demo/spec.md`, never from the PR, so a PR author can't weaken them. A local branch name such as `Verify ai-export-orders` also works. `python verify.py <PR link>` runs the same flow without agents.
+
+All agents run on the same machine as the demo repo and Docker. If a specialist doesn't reply within 300 seconds, its checks count as incomplete and the verdict is INCONCLUSIVE. If the Verdict agent doesn't reply within 60 seconds, the orchestrator applies the same policy gate itself.
 
 ---
 
-## Project Structure (planned)
+## Project Structure
 
 ```
 CodeJury/
-├── orchestrator.py          # User-facing agent: reads diff, routes, enforces mandatory checks
-├── correctness_agent.py     # Spec-first behavioral and regression tests
-├── security_agent.py        # Access-control and data-handling checks
-├── performance_agent.py     # Query counts and workload measurements
-├── verdict_agent.py         # Policy gate + evidence summary
+├── orchestrator.py          # User-facing agent: picks the change, routes, runs baseline, timeouts, chat cards
+├── correctness_agent.py     # Mandatory specialist (port 8002)
+├── security_agent.py        # Access-control and data-handling specialist (port 8003)
+├── performance_agent.py     # Query-count specialist (port 8004)
+├── verdict_agent.py         # Applies the policy gate, LLM writes the summary (port 8005)
+├── specialist.py            # Shared specialist flow: spec-first test generation + sandbox runs
+├── jury.py                  # Routing, baseline, evidence, verdict record (no uAgents)
+├── verify.py                # Whole jury in one process, for debugging and demo fallback
+├── check_branch.py          # Protected tests + gate only, no LLM
 ├── policy_gate.py           # Deterministic PASS / BLOCK / INCONCLUSIVE rules
+├── policy.json              # Mandatory, blocking and advisory categories
 ├── sandbox/                 # Docker runner, image, resource limits
+├── verifier/                # Verifier-owned fixtures and protected tests
+│   └── protected/           # correctness/, security/, performance/
+├── demo/                    # Export Orders app source, the two changes, spec.md, repo builder
 ├── llm.py                   # Meta Model API client (OpenAI SDK)
-├── models.py                # Shared Pydantic message models
-├── config.py                # Agent addresses and policy settings
-├── storage/                 # SQLite + JSON run artifacts
-├── demo_repo/               # Export Orders app, defective and fixed patches
-│   └── tests/protected/     # Verifier-owned tests the implementer can't change
-└── dashboard/               # Stretch: React run viewer
+├── models.py                # uAgents message models
+├── config.py                # .env loading and agent addresses
+└── runs/                    # Saved run artifacts (gitignored)
 ```
 
 ---

@@ -6,6 +6,8 @@ Policy (policy.json):
   mandatory_categories  must have run and completed, whatever the router decided
   blocking_categories   a failed check in these categories blocks the merge
   advisory_categories   failures are reported but never block
+  advisory_sources      checks from these sources (e.g. "generated") never block;
+                        empty by default, so LLM-written tests that fail do block
 
 Rules, in order:
   1. Any failed check in a blocking category             -> BLOCK
@@ -77,13 +79,14 @@ def evaluate(checks: list[dict], policy: dict | None = None) -> dict:
     mandatory = set(policy["mandatory_categories"])
     blocking_cats = set(policy["blocking_categories"])
     advisory_cats = set(policy.get("advisory_categories", []))
+    advisory_sources = set(policy.get("advisory_sources", []))
 
     blocking, inconclusive, advisory, passed = [], [], [], []
     for c in checks:
         status, cat = c.get("status"), c.get("category")
         if status not in CHECK_STATUSES:
             inconclusive.append({**c, "reason": f"unknown status {status!r}"})
-        elif cat in advisory_cats or cat not in blocking_cats:
+        elif cat in advisory_cats or cat not in blocking_cats or c.get("source") in advisory_sources:
             if status != "passed":
                 advisory.append(c)
             else:
