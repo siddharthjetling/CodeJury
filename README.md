@@ -227,6 +227,7 @@ pip install -r requirements.txt
 Copy `.env.example` to `.env` and fill it in. `.env` is gitignored; never commit it.
 
 ```bash
+LLM_PROVIDER=meta                         # meta (default) or asi1 as a fallback
 META_API_KEY=...                          # Meta Model API key
 META_API_BASE_URL=https://api.meta.ai/v1  # Meta's OpenAI-compatible endpoint
 META_MODEL=muse-spark-1.3                 # Model ID used for reasoning

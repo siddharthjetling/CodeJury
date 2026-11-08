@@ -54,6 +54,8 @@ SPECIALIST_ADDRESSES = {
 
 # run_id -> session dict. A session is one verification run.
 sessions: dict[str, dict] = {}
+# user address -> evidence of their latest verdict, for the "View Full Report" button.
+last_reports: dict[str, dict] = {}
 
 
 # ── Messaging helpers ────────────────────────────────────────────────────────
@@ -79,14 +81,22 @@ def _help_text(refs: list[str]) -> str:
     )
 
 
+CARD_PHRASES = ("view full report", "full report", "see agent reports", "view findings",
+                "see_reports", "view_findings", "full_report", "noted")
+
+
 def _card_action(text: str) -> dict | None:
-    """ASI:One sends a card button click back as a JSON chat message."""
+    """Detect a card button click. ASI:One sends it back as a JSON chat message,
+    or its planner sometimes rephrases it as prose ("View Full Report")."""
     try:
         data = json.loads(text)
+        if isinstance(data, dict) and {"action", "finding_id", "defect", "agent", "id"} & data.keys():
+            return data
     except (json.JSONDecodeError, TypeError):
-        return None
-    if isinstance(data, dict) and {"action", "finding_id", "defect", "agent"} & data.keys():
-        return data
+        pass
+    lower = text.lower()
+    if any(p in lower for p in CARD_PHRASES):
+        return {"action": "full_report" if "full report" in lower or "full_report" in lower else "other"}
     return None
 
 
@@ -98,13 +108,22 @@ async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
     text = "".join(item.text for item in msg.content if isinstance(item, TextContent)).strip()
     ctx.logger.info(f"User message: {text[:100]}")
 
-    # Card button clicks are not new verification requests.
-    action = _card_action(text)
+    # Card button clicks are not new verification requests. A PR link always is.
+    action = None if jury.parse_pr_url(text) else _card_action(text)
     if action is not None:
-        reply = ("The agent reports are shown in the carousel above."
-                 if action.get("action") == "see_reports"
-                 else "Got it. Send another PR link to verify a new change.")
-        await send_to_user(ctx, sender, reply, end_session=True)
+        if action.get("action") == "full_report":
+            evidence = last_reports.get(sender)
+            carousel = build_report_carousel(evidence) if evidence else None
+            if carousel:
+                await ctx.send(sender, ChatMessage(timestamp=_now(), msg_id=uuid4(), content=[
+                    TextContent(type="text", text="Full verification report:"),
+                    _card("carousel", carousel),
+                    EndSessionContent(type="end-session"),
+                ]))
+            else:
+                await send_to_user(ctx, sender, "No report yet. Send a PR link to verify first.", end_session=True)
+        else:
+            await send_to_user(ctx, sender, "Send another PR link to verify a new change.", end_session=True)
         return
 
     if any(s["user"] == sender and s["state"] != "done" for s in sessions.values()):
@@ -304,67 +323,92 @@ def build_verdict_text(session: dict, verdict: str, summary: str, reasons: list,
     return "\n".join(lines)
 
 
-def build_verdict_card(session: dict, verdict: str, summary: str, reasons: list, evidence: dict) -> dict:
-    rows = [
-        {"label": "Verdict", "value": verdict},
-        {"label": "Summary", "value": summary},
-        {"label": "Policy",  "value": "; ".join(reasons)},
-        {"label": "Change",  "value": session["label"]},
-        {"label": "Run",     "value": session["run_id"]},
-        {"label": "Jury",    "value": ", ".join(jury.DISPLAY_NAMES[r["category"]] for r in session["routing"])},
+def _shorten_reason(reason: str) -> str:
+    """First sentence or 120 characters of a finding, for the summary card."""
+    first = (reason or "Issue detected").splitlines()[0]
+    for sep in (". ", "; "):
+        if sep in first:
+            return first[:first.index(sep) + 1].strip()
+    return first[:120].strip() + ("..." if len(first) > 120 else "")
+
+
+def build_summary_custom_card(session: dict, verdict: str, summary: str, reasons: list,
+                              evidence: dict) -> dict:
+    """Card 1: verdict, plain-English blocking and incomplete findings, and a
+    "View Full Report" button that opens the full report carousel."""
+    total = sum(d["tests_generated"] for d in evidence.values())
+    passed = sum(d["tests_passed"] for d in evidence.values())
+    blocking = [(n, f) for n, d in evidence.items() for f in d["failures"] if f["severity"] == "blocking"]
+    incomplete = [(n, f) for n, d in evidence.items() for f in d["failures"] if f["severity"] == "incomplete"]
+
+    children = [
+        {"type": "text", "value": "; ".join(reasons), "style": "emphasis"},
+        {"type": "text", "value": f"{passed} of {total} tests passed. Every test ran in the sandbox.",
+         "style": "muted"},
+        {"type": "divider"},
     ]
-    for name, data in evidence.items():
-        if data["tests_failed"]:
-            value = f"{data['tests_failed']} failed / {data['tests_generated']} tests"
-        else:
-            value = f"{data['tests_passed']}/{data['tests_generated']} passed"
-        rows.append({"label": name, "value": value})
-    return {
-        "title": f"CodeJury Verdict: {verdict}",
-        "summary_rows": rows,
-        "ctas": [{"label": "See Agent Reports", "selection": {"action": "see_reports"}, "primary": True}],
-    }
+    for title, items, label, variant in (("Blocking issues", blocking, "BLOCKING", "warning"),
+                                         ("Could not complete", incomplete, "INCOMPLETE", "info")):
+        if items:
+            children.append({"type": "heading", "value": title, "level": 3})
+            for name, f in items[:6]:
+                children.append({"type": "group", "direction": "row", "gap": 4, "children": [
+                    {"type": "badge", "label": label, "variant": variant},
+                    {"type": "text", "value": f"{name}: {_shorten_reason(f['reason'])}", "style": "body"},
+                ]})
+    if not blocking and not incomplete:
+        children.append({"type": "text", "value": "No blocking or incomplete checks.", "style": "body"})
+    children += [
+        {"type": "divider"},
+        {"type": "text", "value": summary, "style": "muted"},
+        {"type": "text", "value": f"{session['label']} · run {session['run_id']}", "style": "muted"},
+        {"type": "button", "label": "View Full Report", "primary": True,
+         "action": {"selection": {"action": "full_report"}}},
+    ]
+    return {"root": {"type": "section", "title": f"CodeJury: {verdict}", "children": children}}
 
 
-def build_findings_carousel(evidence: dict) -> dict | None:
-    """One item per defect or incomplete check, plus one summary item per agent
-    that ran tests and found nothing. An agent with 0 tests is never shown as clean."""
-    items, idx, defects = [], 0, 0
+def build_report_carousel(evidence: dict) -> dict | None:
+    """Card 2, sent when the user clicks View Full Report: one item per finding,
+    plus one item per check group that ran tests and found nothing.
+    A group with 0 tests is never shown as clean."""
+    items, idx, defects, total = [], 0, 0, 0
     for name, data in evidence.items():
+        total += data["tests_generated"]
         for f in data["failures"]:
             idx += 1
             defects += f["severity"] == "blocking"
             variant = {"blocking": "warning", "incomplete": "info", "advisory": "info"}.get(f["severity"], "info")
             items.append({
                 "id": f"defect_{idx}", "title": f["test"],
-                "subtitle": f"{name}: {f['severity']} ({f['source']} test)",
+                "subtitle": f"Found by {name} ({f['source']} test)",
                 "badges": [{"label": f["severity"].upper(), "variant": variant}],
                 "secondary_text": f["reason"],
-                "primary_cta": {"label": "Noted", "selection": {"defect": f"defect_{idx}"}},
+                "primary_cta": {"label": "Details", "selection": {"id": f"defect_{idx}"}},
             })
         if not data["failures"] and data["tests_generated"]:
             idx += 1
             items.append({
-                "id": f"agent_{idx}", "title": f"{name}: all clear",
-                "subtitle": f"{data['tests_passed']} of {data['tests_generated']} tests ran and passed",
-                "badges": [{"label": "PASSED", "variant": "success"}],
-                "secondary_text": "Every test executed in the sandbox and passed",
-                "primary_cta": {"label": "OK", "selection": {"agent": f"agent_{idx}"}},
+                "id": f"agent_{idx}", "title": name,
+                "subtitle": f"{data['tests_passed']} of {data['tests_generated']} tests passed",
+                "badges": [{"label": "ALL CLEAR", "variant": "success"}],
+                "secondary_text": f"No defects found across {data['tests_generated']} executed tests",
+                "primary_cta": {"label": "OK", "selection": {"id": f"agent_{idx}"}},
             })
     if not items:
         return None
-    label = f"{defects} defect(s) found" if defects else "no defects found"
-    return {"title": "CodeJury Agent Reports",
-            "subtitle": f"{len(evidence)} checks: {label}", "items": items}
+    subtitle = (f"{defects} defect(s) across {total} tests. Scroll for details." if defects
+                else f"All {total} tests passed. No defects found.")
+    return {"title": "Full Verification Report", "subtitle": subtitle, "items": items}
 
 
-def _card(kind: str, payload: dict) -> MetadataContent:
+def _card(kind: str, payload: dict, width: str = "600") -> MetadataContent:
     return MetadataContent(type="metadata", metadata={
         "card_protocol_version": "1",
         "requires_card_interaction": "true",
         "card_kind": kind,
         "card_payload": json.dumps(payload),
-        "preferred_drawer_width_px": "600",
+        "preferred_drawer_width_px": width,
     })
 
 
@@ -372,21 +416,14 @@ async def _deliver(ctx: Context, session: dict, verdict: str, summary: str, reas
     session["state"] = "done"
     ctx.logger.info(f"Run {session['run_id']}: {verdict}")
     user = session["user"]
+    last_reports[user] = evidence  # for the "View Full Report" button
 
+    # Full evidence as text (shown by clients without card support) + summary card.
     await ctx.send(user, ChatMessage(timestamp=_now(), msg_id=uuid4(), content=[
         TextContent(type="text", text=build_verdict_text(session, verdict, summary, reasons, evidence)),
-        _card("detail", build_verdict_card(session, verdict, summary, reasons, evidence)),
+        _card("custom", build_summary_custom_card(session, verdict, summary, reasons, evidence), "540"),
+        EndSessionContent(type="end-session"),
     ]))
-
-    carousel = build_findings_carousel(evidence)
-    if carousel:
-        await ctx.send(user, ChatMessage(timestamp=_now(), msg_id=uuid4(), content=[
-            TextContent(type="text", text="Agent reports:"),
-            _card("carousel", carousel),
-            EndSessionContent(type="end-session"),
-        ]))
-    else:
-        await send_to_user(ctx, user, "Verification complete.", end_session=True)
 
 
 @chat_proto.on_message(ChatAcknowledgement)
